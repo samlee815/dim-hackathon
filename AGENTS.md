@@ -96,14 +96,15 @@ source "$DIMOS_VENV/bin/activate" && cd "$REPO_ROOT" && pytest
 ```
 
 ## Tests
-- Every non-trivial pure-Python unit gets a `pytest` test. Keep hardware/DimOS out of unit
-  tests via pure logic (`dribble_planner.py`) or fakes for injected module refs.
+- Every non-trivial unit gets a `pytest` test. Importing DimOS in tests is fine (it is
+  installed in the venv); keep real hardware and heavy models (robot, EdgeTAM, the VLM) out
+  via pure logic (`ball_movement_state.py`) or fakes for injected module refs.
 - Test names state the behavior: `test_records_and_recalls_most_recent_location`.
 - Run tests in the venv (see Environment above): `source "$DIMOS_VENV/bin/activate" && cd "$REPO_ROOT" && pytest`.
 
 ## Project layout
 - `src/pawdribble/` — first-party package (importable via `PYTHONPATH=src`).
-- `tests/` — pytest suite, no DimOS import required (pure-Python logic only).
+- `tests/` — pytest suite: pure-logic tests plus DimOS-glue tests that fake injected refs.
 - `docs/` — design (`pawdribble-design.md`), DimOS agent reference (`dimos-agent-findings.md`),
   and host rationale (`gpu-host-setup.md`).
 - DimOS upstream source for reference lives outside this repo at `$DIMOS_HOME`.

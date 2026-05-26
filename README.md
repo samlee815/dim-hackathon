@@ -30,21 +30,23 @@ teammate-owned integration layer.
 ## Teammate Seam
 
 The planner / navigation / body-charge layer should consume the monitoring
-stream later. This repo keeps the older pure dribble helpers as reference code,
-but the current launcher does not drive `cmd_vel`, plan routes, or kick.
+stream (`/ball_status`, `/debug_image`) later. The current launcher only
+monitors -- it does not drive `cmd_vel`, plan routes, or kick.
 
 ## Layout
 
-- `src/pawdribble/ball_monitor.py` — DimOS skill container for user-described
-  ball monitoring.
-- `src/pawdribble/ball_tracker.py` — pure helpers for position smoothing and
-  bbox/size metrics.
+- `src/pawdribble/ball_movement_monitor.py` — DimOS skill container for
+  user-described ball monitoring (VLM acquire + EdgeTAM track).
+- `src/pawdribble/ball_movement_state.py` — pure tracking logic: bbox/size/
+  centering metrics plus the monitor state machine (status, drift gate,
+  reacquire).
+- `src/pawdribble/ball_movement_motion_fallback.py` — pure frame-diff fallback
+  that re-seeds the tracker when EdgeTAM drops a moving ball.
+- `src/pawdribble/image_source.py` — file/video frame source for no-robot runs.
 - `src/pawdribble/system_prompt.py` — monitoring-focused agent prompt.
-- `scripts/run_pawdribble.py` — off-robot and robot launcher for the monitoring
-  skill. The optional `--include-reference-dribble` flag also exposes the old
-  dribble container for teammate integration checks.
-- `src/pawdribble/dribble_planner.py`, `charge_control.py`,
-  `skill_container.py` — reference dribble/control code, not the active slice.
+- `scripts/run_pawdribble.py` — launcher: `--source FILE` / `--camera` run the
+  monitor end-to-end with no robot (Rerun viewer included), `--robot` at the
+  venue.
 
 ## Run / Test
 

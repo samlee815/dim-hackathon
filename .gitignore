@@ -76,3 +76,7 @@ mobileclip_blt.ts
 
 # local scratch docs
 .local_docs/
+
+# agent related files
+.codex/
+.claude/

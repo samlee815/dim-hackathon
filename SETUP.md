@@ -150,3 +150,36 @@ Local Ollama fallback:
 ollama pull llama3.1:8b
 export PAWDRIBBLE_MODEL=ollama:llama3.1:8b
 ```
+
+## 10. Perception Models (ball monitor)
+
+The monitor needs two extra pieces beyond the agent LLM:
+
+**VLM (ball acquisition by description).** Uses Qwen-VL on Alibaba DashScope.
+`pawdribble.qwen_china.QwenChinaVlModel` points at the **China** endpoint
+(`dashscope.aliyuncs.com`) because DimOS's stock `QwenVlModel` hardcodes the
+*international* endpoint, which 401s for a China Model Studio key. Default model
+is `qwen-vl-max` (returns accurate pixel-space bboxes; the `qwen3-vl-*`
+models return 0-1000 normalized coords the parser does not rescale).
+
+```bash
+export ALIBABA_API_KEY=<china-model-studio-key>
+export PAWDRIBBLE_VLM_MODEL=qwen-vl-max   # optional override
+```
+
+**Tracker (frame-to-frame).** EdgeTAM needs SAM2, shipped as the `edgetam-dimos`
+package (the DimOS `[misc]` extra), not in `[base,unitree]`:
+
+```bash
+pip install edgetam-dimos timm   # timm is needed by EdgeTAM's image encoder
+# or: pip install -e "$DIMOS_HOME[misc]" timm
+```
+
+`timm` is a transitive dependency of EdgeTAM's `TimmBackbone` that
+`edgetam-dimos` does not pull in on its own.
+
+With these in place the monitor runs end-to-end with no robot via
+`--source <image>` / `--camera`: the agent picks the described ball,
+`qwen-vl-max` acquires it, and EdgeTAM tracks it frame to frame. A
+runnable check and a local verification log live in `.local_docs/` (gitignored):
+`python .local_docs/selftest.py`.
