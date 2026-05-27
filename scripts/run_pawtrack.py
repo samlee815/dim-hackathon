@@ -1,33 +1,33 @@
-"""Launch the PawDribble ball-monitoring agentic blueprint.
+"""Launch the PawTrack subject-tracking agentic blueprint.
 
-PawDribble is not registered in DimOS ``all_blueprints``, so it ships its own
+PawTrack is not registered in DimOS ``all_blueprints``, so it ships its own
 launcher. Modes:
 
-- default (off-robot): ``McpServer`` + ``McpClient`` + the ball-monitor skill
-  container. Enough to inspect tool discovery and call tools; no camera frames.
+- default (off-robot): ``McpServer`` + ``McpClient`` + the subject-tracking
+  skill container. Enough to inspect tool discovery and call tools; no frames.
 - ``--camera``: also run a webcam ``CameraModule`` and the Rerun viewer, so the
   whole VLM-acquire + EdgeTAM-track pipeline runs end to end with no robot --
-  point a laptop camera at a ball and describe it.
+  point a laptop camera at the subject and describe it.
 - ``--source PATH``: same end-to-end test but fed from an image or video file
   instead of a webcam -- fully hardware-free (good for CI / a teammate).
-- ``--robot``: the full ``unitree_go2_agentic`` stack + the monitor; the robot
+- ``--robot``: the full ``unitree_go2_agentic`` stack + the tracker; the robot
   supplies the camera frames and viewer.
 
-Describe the ball from the DimOS CLI (no robot needed):
-    dimos mcp call track_ball --arg description="the red ball"  # direct, no LLM
-    dimos agent-send "track the red ball"                       # via the agent
+Describe the subject from the DimOS CLI (no robot needed):
+    dimos mcp call track_subject --arg description="a person sitting on a chair"
+    dimos agent-send "track the person sitting on the chair"   # via the agent
 
 Run (in the venv), e.g. (the first two need no robot):
-    PYTHONPATH=src python scripts/run_pawdribble.py --source ball.jpg
-    PYTHONPATH=src python scripts/run_pawdribble.py --camera
-    PYTHONPATH=src python scripts/run_pawdribble.py --robot
+    PYTHONPATH=src python scripts/run_pawtrack.py --source room.mp4
+    PYTHONPATH=src python scripts/run_pawtrack.py --camera
+    PYTHONPATH=src python scripts/run_pawtrack.py --robot
 
-Diagnostics: ``ball_status`` is a JSON LCM stream; ``debug_image`` is the
+Diagnostics: ``subject_status`` is a JSON LCM stream; ``debug_image`` is the
 annotated camera frame shown in Rerun (green box when tracking, red while
 searching).
 
 Model defaults to ``openai:gpt-5.1`` (needs ``OPENAI_API_KEY``); override with
-``PAWDRIBBLE_MODEL`` (e.g. ``openai:deepseek-chat`` with ``OPENAI_BASE_URL``).
+``PAWTRACK_MODEL`` (e.g. ``openai:deepseek-chat`` with ``OPENAI_BASE_URL``).
 """
 
 from __future__ import annotations
@@ -44,15 +44,15 @@ from dimos.core.global_config import global_config
 from dimos.hardware.sensors.camera.module import CameraModule
 from dimos.visualization.vis_module import vis_module
 
-from pawdribble.image_source import FileImageSource
-from pawdribble.skill_container import PawDribbleSkillContainer
-from pawdribble.system_prompt import PAWDRIBBLE_PROMPT
+from pawtrack.image_source import FileImageSource
+from pawtrack.skill_container import PawTrackSkillContainer
+from pawtrack.system_prompt import PAWTRACK_PROMPT
 
 
 def build_blueprint(
     robot: bool = False, camera: bool = False, source: str | None = None
 ):
-    """Compose the PawDribble ball-monitoring blueprint.
+    """Compose the PawTrack subject-tracking blueprint.
 
     Args:
         robot: Run on the full unitree_go2_agentic stack; the robot supplies
@@ -64,18 +64,18 @@ def build_blueprint(
     Returns:
         The composed blueprint ready for ModuleCoordinator.build.
     """
-    container = PawDribbleSkillContainer.blueprint()
+    container = PawTrackSkillContainer.blueprint()
     if robot:
         base = importlib.import_module(
             "dimos.robot.unitree.go2.blueprints.agentic.unitree_go2_agentic"
         ).unitree_go2_agentic
         # The agentic base already bundles the MCP server + agent, so we just
         # add our skill container (no second McpClient). The prompt-configured
-        # agent lives in the registered `pawdribble-agentic` blueprint; this
+        # agent lives in the registered `pawtrack-agentic` blueprint; this
         # ``--robot`` mode is a quick on-robot test of the standalone launcher.
         return autoconnect(base, container)
-    model = os.environ.get("PAWDRIBBLE_MODEL", "openai:gpt-5.1")
-    agent = McpClient.blueprint(model=model, system_prompt=PAWDRIBBLE_PROMPT)
+    model = os.environ.get("PAWTRACK_MODEL", "openai:gpt-5.1")
+    agent = McpClient.blueprint(model=model, system_prompt=PAWTRACK_PROMPT)
     parts = [McpServer.blueprint(), container, agent]
     if source:
         parts.append(FileImageSource.blueprint(path=source))
@@ -87,7 +87,7 @@ def build_blueprint(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the PawDribble agent.")
+    parser = argparse.ArgumentParser(description="Run the PawTrack agent.")
     parser.add_argument(
         "--robot",
         action="store_true",

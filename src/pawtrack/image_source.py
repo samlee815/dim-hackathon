@@ -1,8 +1,8 @@
 """DimOS glue: publish frames from an image or video file as ``color_image``.
 
-A hardware-free camera source for testing the ball monitor end to end with no
-robot and no webcam: point it at a photo or a short clip that contains a ball,
-then describe the ball from the DimOS CLI. Loops the file so the stream is
+A hardware-free camera source for testing the subject tracker end to end with
+no robot and no webcam: point it at a photo or a short clip that contains the
+subject, then describe it from the DimOS CLI. Loops the file so the stream is
 continuous. Imports DimOS, so it is not unit tested.
 """
 

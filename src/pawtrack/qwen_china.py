@@ -3,7 +3,7 @@
 DimOS's ``QwenVlModel`` hardcodes the international endpoint
 (``dashscope-intl.aliyuncs.com``), which returns 401 for a mainland-China Model
 Studio key. This subclass points at the China endpoint and defaults to a
-current grounding model. Override the model with ``PAWDRIBBLE_VLM_MODEL``.
+current grounding model. Override the model with ``PAWTRACK_VLM_MODEL``.
 
 ``qwen-vl-max`` is the default because it returns accurate pixel-space bounding
 boxes; the ``qwen3-vl-*`` models return 0-1000 normalized coordinates that the
@@ -26,7 +26,7 @@ _DEFAULT_MODEL = "qwen-vl-max"
 class QwenChinaVlModelConfig(QwenVlModelConfig):
     """Qwen VL config defaulting to a current China-endpoint model."""
 
-    model_name: str = os.getenv("PAWDRIBBLE_VLM_MODEL", _DEFAULT_MODEL)
+    model_name: str = os.getenv("PAWTRACK_VLM_MODEL", _DEFAULT_MODEL)
 
 
 class QwenChinaVlModel(QwenVlModel):

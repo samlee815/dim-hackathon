@@ -1,9 +1,9 @@
-"""Tests for the pure frame-difference ball-movement fallback."""
+"""Tests for the pure frame-difference subject-motion fallback."""
 
 import cv2
 import numpy as np
 
-from pawdribble.ball_movement_motion_fallback import detect_motion_bbox
+from pawtrack.motion_fallback import detect_motion_bbox
 
 
 def _frame(cx):
@@ -16,7 +16,7 @@ def test_detects_a_moving_blob():
     bbox = detect_motion_bbox(_frame(80), _frame(220))
     assert bbox is not None
     x1, y1, x2, y2 = bbox
-    # The moving region sits in the ball's vertical band and is ball-sized.
+    # The moving region sits in the marker's vertical band and is marker-sized.
     assert y1 < 100 < y2
     assert (x2 - x1) > 20 and (y2 - y1) > 20
 

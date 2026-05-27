@@ -1,7 +1,7 @@
-"""Pure frame-difference fallback for ball-movement detection.
+"""Pure frame-difference fallback for subject-motion detection.
 
-When the primary tracker (EdgeTAM) drops the ball -- common when a fast-moving
-ball blurs or briefly leaves the mask -- this finds the largest *moving* region
+When the primary tracker (EdgeTAM) drops the subject -- common when a fast
+mover blurs or briefly leaves the mask -- this finds the largest *moving* region
 between two consecutive frames, so the monitor can cheaply re-seed the tracker
 on it instead of escalating straight to the (slow, networked) VLM reacquire.
 
@@ -9,9 +9,9 @@ Pure: numpy + OpenCV only, no DimOS, no models -- unit tested with synthetic
 frames. Operates on BGR uint8 arrays (``Image.to_opencv()``).
 
 Assumes a roughly static camera: it returns the largest moving blob over the
-whole frame, so under camera ego-motion (e.g. a robot body-charge) the
-background can dominate. Gate it on robot motion state -- or disable it via the
-monitor's ``motion_fallback`` config -- when the camera itself is moving.
+whole frame, so under camera ego-motion (e.g. a wandering robot) the background
+can dominate. Gate it on robot motion state -- or disable it via the monitor's
+``motion_fallback`` config -- when the camera itself is moving.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ def detect_motion_bbox(
     curr_gray = cv2.cvtColor(curr_bgr, cv2.COLOR_BGR2GRAY)
     diff = cv2.absdiff(prev_gray, curr_gray)
     _, mask = cv2.threshold(diff, diff_threshold, 255, cv2.THRESH_BINARY)
-    # Dilate so the two halves of a moving ball merge into one blob.
+    # Dilate so the disjoint halves of one moving subject merge into one blob.
     mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=2)
 
     count, _labels, stats, _ = cv2.connectedComponentsWithStats(mask)

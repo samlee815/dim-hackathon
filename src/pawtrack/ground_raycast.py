@@ -1,12 +1,12 @@
-"""Pure pixel-to-ground raycast for absolute ball positioning (no DimOS).
+"""Pure pixel-to-ground raycast for absolute subject positioning (no DimOS).
 
-Given the tracked ball's pixel in the camera image, the camera intrinsics, and
-the camera's pose in a target frame, intersect the viewing ray with a
-horizontal ground plane to recover the ball's position in that frame.
+Given the tracked subject's pixel in the camera image, the camera intrinsics,
+and the camera's pose in a target frame, intersect the viewing ray with a
+horizontal ground plane to recover the subject's position in that frame.
 
-This is approach "B": it needs no depth sensor and no lidar return on the ball
--- only the camera pose and a known ground height -- so it stays robust for a
-small ball on a flat floor, where a sparse lidar would miss it (and so
+This is approach "B": it needs no depth sensor and no lidar return on the
+subject -- only the camera pose and a known ground height -- so it stays robust
+for a subject on a flat floor, where a sparse lidar might miss it (and so
 ``Detection3DPC.from_2d`` would return nothing). The result is *absolute* only
 insofar as the supplied camera-to-target transform is into an absolute frame
 (the ``map`` frame from relocalization); given a ``world``/odom transform the
@@ -79,14 +79,15 @@ def pixel_to_ground_point(
     ``camera_to_target``, and intersected with the plane ``z == ground_z``.
 
     Args:
-        pixel: ``(u, v)`` pixel coordinates of the point (e.g. the ball bbox
-            center).
+        pixel: ``(u, v)`` pixel coordinates of the point (e.g. the subject's
+            bbox bottom-center, where it meets the floor).
         intrinsics: Pinhole camera intrinsics.
         camera_to_target: 4x4 homogeneous transform mapping a camera-optical
             point to the target frame -- i.e. ``tf.get(target, camera_optical)
             .to_matrix()``.
-        ground_z: Height of the ground plane in the target frame. Pass the ball
-            radius to get the ball center (not the floor contact point).
+        ground_z: Height of the ground plane in the target frame. Pass ``0``
+            (the floor) for a pixel that sits on the floor; pass an offset only
+            if the chosen pixel is above the floor.
 
     Returns:
         ``(x, y, z)`` of the ray/plane intersection in the target frame, or

@@ -1,15 +1,17 @@
-"""Pure ball-movement tracking logic: visual metrics + monitor state machine.
+"""Pure subject-tracking logic: visual metrics + monitor state machine.
 
-Two cohesive, dependency-free concerns for following a ball frame to frame:
+Two cohesive, dependency-free concerns for following a tracked subject frame to
+frame:
 
 - Visual metrics: summarize a tracked bbox/mask into stable image-space metrics
-  (size and centering) for the status stream (:class:`BallVisualObservation`,
-  :class:`BallTrackMetrics`, :func:`visual_metrics`).
+  (size and centering) for the status stream (:class:`VisualObservation`,
+  :class:`TrackMetrics`, :func:`visual_metrics`), plus the ground-contact pixel
+  for back-projection (:func:`ground_contact_pixel`).
 - Monitor state machine: fold each frame's metrics (or a miss) into a status
   snapshot, applying a motion-aware drift gate and deciding when to reacquire
-  (:class:`BallMonitorSnapshot`, :class:`MonitorParams`, :class:`MonitorState`).
+  (:class:`TrackSnapshot`, :class:`MonitorParams`, :class:`MonitorState`).
 
-No DimOS imports -- unit tested. The DimOS ``PawDribbleSkillContainer``
+No DimOS imports -- unit tested. The DimOS ``PawTrackSkillContainer``
 performs the effects (run the tracker/VLM, publish snapshots) and feeds this
 machine each frame's result via :meth:`MonitorState.observe`; the machine
 decides the status and what to do next.
@@ -25,8 +27,8 @@ from typing import Literal
 
 
 @dataclasses.dataclass(frozen=True)
-class BallVisualObservation:
-    """One tracked ball observation in image coordinates.
+class VisualObservation:
+    """One tracked-subject observation in image coordinates.
 
     Attributes:
         bbox: Detection box ``(x1, y1, x2, y2)`` in pixels.
@@ -44,8 +46,8 @@ class BallVisualObservation:
 
 
 @dataclasses.dataclass(frozen=True)
-class BallTrackMetrics:
-    """Size and centering metrics for a tracked ball."""
+class TrackMetrics:
+    """Size and centering metrics for a tracked subject."""
 
     bbox: tuple[float, float, float, float]
     center_px: tuple[float, float]
@@ -60,11 +62,11 @@ class BallTrackMetrics:
     mask_area_ratio: float | None
 
 
-def visual_metrics(observation: BallVisualObservation) -> BallTrackMetrics:
-    """Compute image-space monitoring metrics for one tracked ball.
+def visual_metrics(observation: VisualObservation) -> TrackMetrics:
+    """Compute image-space monitoring metrics for one tracked subject.
 
     Args:
-        observation: Tracked ball bbox/mask metadata for one frame.
+        observation: Tracked subject bbox/mask metadata for one frame.
 
     Returns:
         Normalized centering and size metrics suitable for status streams.
@@ -90,7 +92,7 @@ def visual_metrics(observation: BallVisualObservation) -> BallTrackMetrics:
         if observation.mask_area_px is not None
         else None
     )
-    return BallTrackMetrics(
+    return TrackMetrics(
         bbox=observation.bbox,
         center_px=(center_x, center_y),
         width_px=width,
@@ -108,6 +110,24 @@ def visual_metrics(observation: BallVisualObservation) -> BallTrackMetrics:
 
 
 Bbox = tuple[float, float, float, float]
+
+
+def ground_contact_pixel(bbox: Bbox) -> tuple[float, float]:
+    """Pixel where the tracked subject meets the floor: bbox bottom-center.
+
+    A standing or seated subject (or the chair it sits on) touches the floor at
+    the bottom edge of its bounding box, so the bottom-center pixel back-projects
+    to the subject's position on the ground. The bbox *center* would instead sit
+    at torso/seat height and project to a biased ground point.
+
+    Args:
+        bbox: Detection box ``(x1, y1, x2, y2)`` in pixels.
+
+    Returns:
+        ``(u, v)`` pixel at the horizontal center of the bbox's bottom edge.
+    """
+    x1, _y1, x2, y2 = bbox
+    return ((x1 + x2) / 2.0, y2)
 
 
 def is_bbox_shape(values: list[float] | None) -> bool:
@@ -149,9 +169,9 @@ def clamp_bbox(bbox: Bbox, width: int, height: int) -> Bbox:
     """Clamp a (valid, overlapping) bbox to image bounds.
 
     EdgeTAM is initialized from this box, so a box that spills past the frame
-    edge -- common for a VLM box on a ball against an edge -- would otherwise
+    edge -- common for a VLM box on a subject against an edge -- would otherwise
     distort initialization. Clamping keeps the visible portion rather than
-    rejecting the ball. A box that passed :func:`valid_bbox` stays
+    rejecting the subject. A box that passed :func:`valid_bbox` stays
     non-degenerate after clamping.
     """
     x1, y1, x2, y2 = bbox
@@ -172,7 +192,7 @@ Action = Literal["track", "coast", "reacquire", "give_up"]
 
 
 @dataclasses.dataclass(frozen=True)
-class BallMonitorSnapshot:
+class TrackSnapshot:
     """Latest monitor state, suitable for JSON status output."""
 
     status: Status
@@ -198,7 +218,7 @@ class BallMonitorSnapshot:
             now: Current monotonic timestamp. Defaults to ``time.monotonic()``.
 
         Returns:
-            Compact JSON for the ``ball_status`` stream.
+            Compact JSON for the ``subject_status`` stream.
         """
         now = time.monotonic() if now is None else now
         data = dataclasses.asdict(self)
@@ -217,7 +237,7 @@ class MonitorParams:
     max_lost_frames: int = 15  # coast this long before reacquiring
     reacquire_interval_frames: int = 15  # reacquire cadence while lost
     max_reacquire_attempts: int = 5  # give up after this many failed retries
-    max_center_jump_frac: float = 2.5  # reject jumps beyond this x ball width
+    max_center_jump_frac: float = 2.5  # reject jumps beyond this x subject width
     max_area_factor: float = 4.0  # reject area changes beyond this factor
     stale_timeout_s: float = 2.0  # no fix longer than this -> "stale"
 
@@ -226,10 +246,10 @@ def _from_metrics(
     status: Status,
     description: str,
     message: str,
-    metrics: BallTrackMetrics,
+    metrics: TrackMetrics,
     seen_at: float,
-) -> BallMonitorSnapshot:
-    return BallMonitorSnapshot(
+) -> TrackSnapshot:
+    return TrackSnapshot(
         status=status,
         description=description,
         message=message,
@@ -263,25 +283,25 @@ class MonitorState:
         self._lost = 0
         self._reacquire_attempts = 0
         self._skip_gate = False
-        self._last_tracked: BallMonitorSnapshot | None = None
-        self._snapshot = BallMonitorSnapshot(
+        self._last_tracked: TrackSnapshot | None = None
+        self._snapshot = TrackSnapshot(
             status="idle",
             description=None,
-            message="No ball is being monitored.",
+            message="Nothing is being tracked.",
         )
 
     @property
-    def snapshot(self) -> BallMonitorSnapshot:
+    def snapshot(self) -> TrackSnapshot:
         """The current authoritative snapshot."""
         return self._snapshot
 
-    def begin(self, description: str) -> BallMonitorSnapshot:
+    def begin(self, description: str) -> TrackSnapshot:
         """Enter ``acquiring`` for a new target; reset counters/history."""
         self._lost = 0
         self._reacquire_attempts = 0
         self._skip_gate = False
         self._last_tracked = None
-        self._snapshot = BallMonitorSnapshot(
+        self._snapshot = TrackSnapshot(
             status="acquiring",
             description=description,
             message=f"Looking for {description}.",
@@ -291,13 +311,13 @@ class MonitorState:
     def observe(
         self,
         description: str,
-        metrics: BallTrackMetrics | None,
+        metrics: TrackMetrics | None,
         now: float,
-    ) -> tuple[BallMonitorSnapshot, Action]:
+    ) -> tuple[TrackSnapshot, Action]:
         """Fold one frame's result in and decide the next action.
 
         Args:
-            description: The tracked ball's description.
+            description: The tracked subject's description.
             metrics: This frame's tracked metrics, or None if the tracker had
                 no usable detection.
             now: Current monotonic timestamp.
@@ -320,25 +340,25 @@ class MonitorState:
         self._reacquire_attempts = 0
         self._skip_gate = True
 
-    def errored(self, description: str, message: str) -> BallMonitorSnapshot:
+    def errored(self, description: str, message: str) -> TrackSnapshot:
         """Surface a loud error status, keeping the last known fix."""
         self._snapshot = self._carry_forward("error", description, message)
         return self._snapshot
 
-    def stopped(self) -> BallMonitorSnapshot:
+    def stopped(self) -> TrackSnapshot:
         """Reset to a clean stopped state."""
         self._lost = 0
         self._reacquire_attempts = 0
         self._skip_gate = False
         self._last_tracked = None
-        self._snapshot = BallMonitorSnapshot(
+        self._snapshot = TrackSnapshot(
             status="stopped",
             description=None,
-            message="Stopped monitoring the ball.",
+            message="Stopped tracking.",
         )
         return self._snapshot
 
-    def _is_plausible(self, metrics: BallTrackMetrics) -> bool:
+    def _is_plausible(self, metrics: TrackMetrics) -> bool:
         last = self._last_tracked
         if self._skip_gate or last is None or last.center_px is None:
             return True
@@ -356,8 +376,8 @@ class MonitorState:
         return True
 
     def _accept(
-        self, description: str, metrics: BallTrackMetrics, now: float
-    ) -> BallMonitorSnapshot:
+        self, description: str, metrics: TrackMetrics, now: float
+    ) -> TrackSnapshot:
         self._lost = 0
         self._reacquire_attempts = 0
         self._skip_gate = False
@@ -370,10 +390,10 @@ class MonitorState:
 
     def _miss(
         self, description: str, now: float
-    ) -> tuple[BallMonitorSnapshot, Action]:
+    ) -> tuple[TrackSnapshot, Action]:
         self._lost += 1
         action: Action = "coast"
-        message = "Lost sight of the ball."
+        message = "Lost sight of the target."
         due = (
             self._lost >= self._params.max_lost_frames
             and (self._lost - self._params.max_lost_frames)
@@ -383,7 +403,7 @@ class MonitorState:
             self._reacquire_attempts += 1
             if self._reacquire_attempts > self._params.max_reacquire_attempts:
                 action = "give_up"
-                message = "Gave up reacquiring the ball."
+                message = "Gave up reacquiring the target."
             else:
                 action = "reacquire"
         status: Status = "lost"
@@ -395,16 +415,16 @@ class MonitorState:
         ):
             status = "stale"
             if action == "coast":
-                message = "No fix for a while; the ball is stale."
+                message = "No fix for a while; the target is stale."
         snap = self._carry_forward(status, description, message)
         self._snapshot = snap
         return snap, action
 
     def _carry_forward(
         self, status: Status, description: str, message: str
-    ) -> BallMonitorSnapshot:
+    ) -> TrackSnapshot:
         if self._last_tracked is None:
-            return BallMonitorSnapshot(status, description, message)
+            return TrackSnapshot(status, description, message)
         return dataclasses.replace(
             self._last_tracked,
             status=status,

@@ -1,20 +1,20 @@
-"""Version-controlled copy of the PawDribble `dimos run` blueprint.
+"""Version-controlled copy of the PawTrack `dimos run` blueprint.
 
 `dimos run <name>` resolves names from a registry that the generator builds by
 scanning only the dimos source tree, so the blueprint object has to live inside
 that tree. This file is the canonical copy; install it with:
 
-    cp integration/pawdribble_agentic.py \\
+    cp integration/pawtrack_agentic.py \\
         "$DIMOS_HOME/dimos/robot/unitree/go2/blueprints/agentic/"
     pytest "$DIMOS_HOME/dimos/robot/test_all_blueprints_generation.py"  # regen
 
-Then (with the `pawdribble` package importable):
+Then (with the `pawtrack` package importable):
 
-    PYTHONPATH=src dimos run pawdribble-agentic --robot-ip <dog_ip>
+    PYTHONPATH=src dimos run pawtrack-agentic --robot-ip <dog_ip>
 
 It rebuilds the four parts of the stock ``unitree-go2-agentic`` blueprint but
-swaps in an ``McpClient`` with the PawDribble prompt and adds the PawDribble
-skill container (perception + kick) -- reusing the stock stack, no duplicate
+swaps in an ``McpClient`` with the PawTrack prompt and adds the PawTrack
+subject-tracking skill container -- reusing the stock stack, no duplicate
 agent.
 """
 
@@ -32,15 +32,15 @@ from dimos.robot.unitree.go2.blueprints.smart.unitree_go2_spatial import (
     unitree_go2_spatial,
 )
 
-from pawdribble.skill_container import PawDribbleSkillContainer
-from pawdribble.system_prompt import PAWDRIBBLE_PROMPT
+from pawtrack.skill_container import PawTrackSkillContainer
+from pawtrack.system_prompt import PAWTRACK_PROMPT
 
-_MODEL = os.environ.get("PAWDRIBBLE_MODEL", "openai:gpt-5.1")
+_MODEL = os.environ.get("PAWTRACK_MODEL", "openai:gpt-5.1")
 
-pawdribble_agentic = autoconnect(
+pawtrack_agentic = autoconnect(
     unitree_go2_spatial,
     McpServer.blueprint(),
-    McpClient.blueprint(model=_MODEL, system_prompt=PAWDRIBBLE_PROMPT),
+    McpClient.blueprint(model=_MODEL, system_prompt=PAWTRACK_PROMPT),
     _common_agentic,
-    PawDribbleSkillContainer.blueprint(),
+    PawTrackSkillContainer.blueprint(),
 )

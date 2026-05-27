@@ -1,23 +1,23 @@
-"""DimOS skill container for PawDribble: find, track, and kick a ball.
+"""DimOS skill container for PawTrack: find and track a described subject.
 
-One container exposes the whole PawDribble robot behavior as DimOS skills:
+One container exposes the perception stage as DimOS skills: the user (or the
+agent) describes a subject -- a person sitting on a chair, a person in a red
+shirt, any object -- a VLM localizes it, EdgeTAM tracks the selected subject
+frame-to-frame, and JSON status (bbox, centering, size) is published. Decision
+logic lives in the pure ``MonitorState``; this module runs the effects
+(tracker/VLM, publish snapshots, debug frames). The monitor loop fails loudly --
+any exception is logged and surfaced as an ``error`` status rather than letting
+the worker thread die silently. When EdgeTAM drops a fast-moving subject, an
+optional frame-motion fallback re-seeds the tracker before retrying.
 
-- Perception: the user describes a ball, a VLM localizes it, EdgeTAM tracks the
-  selected object frame-to-frame, and JSON status (bbox, centering, size) is
-  published. Decision logic lives in the pure ``MonitorState``; this module runs
-  the effects (tracker/VLM, publish snapshots, debug frames). The monitor loop
-  fails loudly -- any exception is logged and surfaced as an ``error`` status
-  rather than letting the worker thread die silently. When EdgeTAM drops a
-  moving ball, a frame-motion fallback re-seeds the tracker before retrying.
-- Kick: once an upstream planner has positioned the robot behind the ball, a
-  short forward ``cmd_vel`` body-charge (the Go2 has no joint-level kick over
-  its link) drives through the ball, then stops. Velocity math is the pure
-  ``kick_profile``. Obstacle avoidance would brake the charge, so it is disabled
-  for the charge window and the configured state restored after, via the
-  injected GO2 connection (a no-op off-robot, where no connection is wired).
+Alongside the status stream, the tracked subject's ground position is published
+for an upstream planner: the subject's ground-contact pixel (bottom-center of
+the bbox) is back-projected onto the floor plane (approach "B") in the live
+``world`` frame, and -- when relocalization is running -- in the prebuilt
+``map`` frame too.
 
-The monitor (continuous, sensor-driven) and the kick (on-demand burst) are
-independent; they share only the module's lock.
+This container is perception only: it never drives the robot. Motion (wander,
+approach, greet) belongs to a separate container.
 """
 
 from __future__ import annotations
@@ -41,65 +41,56 @@ from dimos.models.qwen.bbox import BBox
 from dimos.models.segmentation.edge_tam import EdgeTAMProcessor
 from dimos.models.vl.base import VlModel
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
-from dimos.msgs.geometry_msgs.Twist import Twist
-from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo
 from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
 from dimos.navigation.visual.query import get_object_bbox_from_image
 from dimos.perception.detection.type.detection2d.bbox import Detection2DBBox
-from dimos.robot.unitree.go2.connection_spec import GO2ConnectionSpec
 from dimos.utils.logging_config import setup_logger
-from unitree_webrtc_connect.constants import RTC_TOPIC
 
-from pawdribble.ball_movement_motion_fallback import detect_motion_bbox
-from pawdribble.ball_movement_state import (
-    BallMonitorSnapshot,
-    BallVisualObservation,
+from pawtrack.ground_raycast import CameraIntrinsics, pixel_to_ground_point
+from pawtrack.motion_fallback import detect_motion_bbox
+from pawtrack.qwen_china import QwenChinaVlModel
+from pawtrack.track_state import (
     MonitorParams,
     MonitorState,
+    TrackSnapshot,
+    VisualObservation,
     bbox_in_image,
     clamp_bbox,
+    ground_contact_pixel,
     is_bbox_shape,
     valid_bbox,
     visual_metrics,
 )
-from pawdribble.ground_raycast import CameraIntrinsics, pixel_to_ground_point
-from pawdribble.kick_profile import KickParams, charge_velocity
-from pawdribble.qwen_china import QwenChinaVlModel
 
 logger = setup_logger()
 
 
 class Config(ModuleConfig):
-    """Configuration for the PawDribble skills (ball monitor + kick)."""
+    """Configuration for the PawTrack subject-tracking skills."""
 
-    # Ball monitoring.
+    # Subject tracking.
     monitor_loop_hz: float = 15.0
     max_lost_frames: int = 15  # frames without a mask before reacquiring
     reacquire_interval_frames: int = 15  # VLM retry cadence while lost
     max_reacquire_attempts: int = 5  # give up after this many failed retries
-    motion_fallback: bool = True  # re-seed tracker from frame motion on a miss
-    max_center_jump_frac: float = 2.5  # reject jumps beyond this x ball width
+    # Re-seed the tracker from frame motion on a miss. OFF by default: it
+    # re-seeds on the largest MOVING blob, which is wrong whenever the camera
+    # itself moves (a wandering/approaching dog makes the whole frame move, so
+    # it would lock onto the background). Reacquire via the VLM instead.
+    motion_fallback: bool = False
+    max_center_jump_frac: float = 2.5  # reject jumps beyond this x subject width
     max_area_factor: float = 4.0  # reject area changes beyond this factor
     stale_timeout_s: float = 2.0  # no fix longer than this -> "stale"
-    # Body-charge kick.
-    kick_speed_mps: float = 0.8  # peak forward charge speed
-    kick_duration_s: float = 0.8  # total charge time
-    kick_ramp_s: float = 0.15  # ramp-in/-out to soften the start/stop
-    kick_loop_hz: float = 20.0  # cmd_vel re-publish rate (beats the watchdog)
-    kick_max_speed_mps: float = 1.5  # hard safety clamp on forward speed
-    kick_max_duration_s: float = 2.0  # hard safety clamp on charge duration
-    kick_max_yaw_radps: float = 1.0  # hard safety clamp on yaw
-    # Ball position (ground-plane raycast, approach "B"). The tracked ball
-    # pixel is back-projected to the floor in the live world frame for the
-    # planner. If relocalization is live, the same point is also published in
-    # the stable map frame.
+    # Subject position (ground-plane raycast, approach "B"). The tracked
+    # subject's ground-contact pixel -- the bottom-center of the bbox, where it
+    # meets the floor -- is back-projected to the floor in the live world frame
+    # for the planner. If relocalization is live, the same point is also
+    # published in the stable map frame.
     camera_info: CameraInfo | None = None  # intrinsics; auto-resolved if None
-    # Ball-center height above the floor, assuming a roughly 22 cm ball.
-    ball_radius_m: float = 0.11
-    # Floor height (z) in each frame, kept separate from the ball radius so a
-    # frame whose z=0 is not the floor is a config change, not a logic change.
-    # The raycast plane is ``floor_z + ball_radius_m`` (the ball center).
+    # Floor height (z) in each frame. The raycast plane is exactly this height:
+    # the bottom of the bbox (feet / seat / chair base) rests on the floor, so
+    # no object-size offset is added.
     world_floor_z_m: float = 0.0  # floor z in the live odometry frame
     map_floor_z_m: float = 0.0  # floor z in the prebuilt-map frame
     world_frame_id: str = "world"  # always-on live odometry frame
@@ -117,26 +108,21 @@ class Config(ModuleConfig):
     pose_probe_interval_s: float = 2.0
 
 
-class PawDribbleSkillContainer(Module):
-    """Find, track, and body-charge a user-described ball."""
+class PawTrackSkillContainer(Module):
+    """Find and track a user-described subject, publishing status and position."""
 
     config: Config
 
     color_image: In[Image]
-    ball_status: Out[str]  # JSON status (LCM diagnostic stream)
+    subject_status: Out[str]  # JSON status (LCM diagnostic stream)
     debug_image: Out[Image]  # annotated camera frame (shows in Rerun)
-    cmd_vel: Out[Twist]  # body-charge velocity to the robot
-    kick_status: Out[str]  # human-readable kick diagnostics
-    ball_world_pose: Out[PoseStamped]  # ball position in live odometry frame
-    ball_map_pose: Out[PoseStamped]  # optional ball position in premap frame
-    # Injected on the robot stack; None off-robot (avoidance toggle skipped).
-    _connection: GO2ConnectionSpec | None = None
+    subject_world_pose: Out[PoseStamped]  # position in live odometry frame
+    subject_map_pose: Out[PoseStamped]  # optional position in premap frame
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._lock = threading.RLock()
         self._monitor_stop = threading.Event()
-        self._kick_stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._latest_image: Image | None = None
         self._prev_image: Image | None = None
@@ -151,9 +137,6 @@ class PawDribbleSkillContainer(Module):
         self._snapshot = self._state.snapshot
         self._vl_model: VlModel | None = None
         self._tracker: EdgeTAMProcessor | None = None
-        self._kicking = False
-        # Believed onboard avoidance state, so we skip redundant RTC requests.
-        self._avoidance_enabled: bool | None = None
         self._intrinsics = self._resolve_intrinsics()
         self._warned_no_world_tf = False
         self._warned_no_map_tf = False
@@ -206,7 +189,6 @@ class PawDribbleSkillContainer(Module):
 
     @rpc
     def stop(self) -> None:
-        self._kick_stop.set()
         self._stop_monitoring()
         with self._lock:
             tracker = self._tracker
@@ -222,26 +204,30 @@ class PawDribbleSkillContainer(Module):
     # -- Perception skills --
 
     @skill
-    def track_ball(
+    def track_subject(
         self,
-        description: str,
+        description: str = "a person sitting on a chair",
         initial_bbox: list[float] | None = None,
         initial_image: str | None = None,
     ) -> str:
-        """Start monitoring the ball matching a visual description.
+        """Start tracking the subject matching a visual description.
 
-        Use this when the user asks to find, track, watch, or monitor a
-        specific ball. The description should identify the ball visually, for
-        example "the red ball", "the tennis ball", or "the blue striped ball".
+        Use this to find, track, watch, or monitor anything the user describes
+        -- a person sitting on a chair, a person in a red shirt, a bottle, a
+        backpack -- so never refuse based on what the subject is. The
+        description should identify it visually, for example "a person sitting
+        on a chair" or "the person in the blue jacket". With no description, it
+        looks for a person sitting on a chair (the greeter's default target).
 
         Args:
-            description: Visual description of the ball to monitor.
+            description: Visual description of the subject to track. Defaults to
+                "a person sitting on a chair".
             initial_bbox: Optional bbox ``[x1, y1, x2, y2]`` to skip VLM
-                acquisition when another tool or UI already selected the ball.
+                acquisition when another tool or UI already selected the subject.
             initial_image: Optional base64 JPEG matching ``initial_bbox``.
 
         Returns:
-            Status text describing whether monitoring started.
+            Status text describing whether tracking started.
         """
         if initial_bbox is not None and not is_bbox_shape(initial_bbox):
             return "initial_bbox must be four numbers [x1, y1, x2, y2]."
@@ -251,7 +237,7 @@ class PawDribbleSkillContainer(Module):
         with self._lock:
             latest_image = self._latest_image
         if latest_image is None:
-            return "No image available to identify the ball."
+            return "No image available to identify the subject."
 
         # Reset the state machine for the new target before EITHER acquisition
         # path, so a previous track's last fix cannot carry forward under the
@@ -275,7 +261,7 @@ class PawDribbleSkillContainer(Module):
                 description,
             )
             if detected is None:
-                self._set_snapshot(BallMonitorSnapshot(
+                self._set_snapshot(TrackSnapshot(
                     status="lost",
                     description=description,
                     message=f"Could not find {description} in view.",
@@ -286,87 +272,18 @@ class PawDribbleSkillContainer(Module):
         return self._start_tracking(description, bbox, detection_image)
 
     @skill
-    def stop_tracking_ball(self) -> str:
-        """Stop monitoring the currently tracked ball."""
+    def stop_tracking(self) -> str:
+        """Stop tracking the current subject."""
         self._stop_monitoring()
         self._set_snapshot(self._state.stopped())
-        return "Stopped monitoring the ball."
+        return "Stopped tracking."
 
     @skill
-    def ball_tracking_status(self) -> str:
-        """Return the latest tracked-ball bbox, size, and centering metrics."""
+    def tracking_status(self) -> str:
+        """Return the latest tracked-subject bbox, size, and centering metrics."""
         with self._lock:
             snapshot = self._snapshot
         return snapshot.to_json()
-
-    # -- Kick skills --
-
-    @skill
-    def kick_ball(
-        self,
-        speed_mps: float | None = None,
-        duration_s: float | None = None,
-    ) -> str:
-        """Kick the ball forward with a body-charge.
-
-        Call this only when the robot is already positioned directly behind the
-        ball and facing it -- the planner handles the approach and aiming. The
-        robot drives a short forward burst through the ball and then stops; it
-        does not steer, so do not call this until the ball is centered ahead.
-
-        Args:
-            speed_mps: Optional peak charge speed override (m/s).
-            duration_s: Optional charge duration override (seconds).
-
-        Returns:
-            Status text describing the kick or why it was refused.
-        """
-        with self._lock:
-            if self._kicking:
-                return "Already kicking; ignoring the new kick request."
-            self._kicking = True
-        speed = self.config.kick_speed_mps if speed_mps is None else speed_mps
-        duration = (
-            self.config.kick_duration_s if duration_s is None else duration_s
-        )
-        try:
-            params = KickParams(
-                speed_mps=speed,
-                duration_s=duration,
-                ramp_s=self.config.kick_ramp_s,
-                max_speed_mps=self.config.kick_max_speed_mps,
-                max_duration_s=self.config.kick_max_duration_s,
-                max_yaw_radps=self.config.kick_max_yaw_radps,
-            )
-        except ValueError as err:
-            logger.error("kick_ball: invalid parameters: %s", err)
-            with self._lock:
-                self._kicking = False
-            return f"Invalid kick parameters: {err}"
-        try:
-            return self._charge(params)
-        finally:
-            with self._lock:
-                self._kicking = False
-
-    @skill
-    def stop_kick(self) -> str:
-        """Stop an in-progress body-charge kick and publish zero velocity.
-
-        Call this when the user asks to cancel, stop, abort, or interrupt a
-        kick. It is safe to call when no kick is running.
-
-        Returns:
-            Status text describing whether a kick was stopped.
-        """
-        with self._lock:
-            was_kicking = self._kicking
-        self._kick_stop.set()
-        self.cmd_vel.publish(Twist.zero())
-        if was_kicking:
-            self.kick_status.publish("Kick stop requested; stopping the robot.")
-            return "Stopping the kick."
-        return "No kick is currently running."
 
     # -- Internals: perception --
 
@@ -395,13 +312,13 @@ class PawDribbleSkillContainer(Module):
         with self._lock:
             latest_image = self._latest_image
         if latest_image is None:
-            return "No image available to start ball tracking."
+            return "No image available to start tracking."
         init_image = (
             detection_image if detection_image is not None else latest_image
         )
         if not valid_bbox(bbox, init_image.width, init_image.height):
             logger.error(
-                "track_ball: invalid bbox %s for a %dx%d image",
+                "track_subject: invalid bbox %s for a %dx%d image",
                 bbox, init_image.width, init_image.height,
             )
             self._set_snapshot(self._state.errored(
@@ -418,27 +335,27 @@ class PawDribbleSkillContainer(Module):
             image=init_image, box=np.array(bbox, dtype=np.float32), obj_id=1
         )
         if len(initial_detections) == 0:
-            self._set_snapshot(BallMonitorSnapshot(
+            self._set_snapshot(TrackSnapshot(
                 status="lost",
                 description=description,
                 message=f"Tracker could not initialize on {description}.",
             ))
             return f"Could not initialize tracking for '{description}'."
 
-        self.start_tool("track_ball")
+        self.start_tool("track_subject")
         with self._lock:
             self._prev_image = None
             self._monitor_stop.clear()
             self._thread = threading.Thread(
                 target=self._monitor_loop,
                 args=(tracker, description),
-                name="ball-monitor",
+                name="subject-monitor",
                 daemon=True,
             )
             self._thread.start()
 
         return (
-            f"Started monitoring '{description}'. Call ball_tracking_status for"
+            f"Started tracking '{description}'. Call tracking_status for"
             " the latest size and position metrics."
         )
 
@@ -471,14 +388,14 @@ class PawDribbleSkillContainer(Module):
                 if image is not None:
                     drawn = detection if snapshot.status == "tracking" else None
                     self._publish_debug(description, image, drawn)
-                    if drawn is not None and snapshot.center_px is not None:
-                        self._publish_ground_poses(image, snapshot.center_px)
+                    if drawn is not None and snapshot.bbox is not None:
+                        self._publish_ground_poses(image, snapshot.bbox)
             except Exception:  # noqa: BLE001 - thread-boundary guard
                 # Deliberately broad: this is the worker-thread top level. Fail
                 # LOUDLY (full traceback + an `error` status) instead of letting
                 # the thread die silently and freeze the status.
                 logger.exception(
-                    "ball monitor loop crashed for %r", description)
+                    "subject monitor loop crashed for %r", description)
                 self._set_snapshot(self._state.errored(
                     description, "Monitor loop error; see logs."))
                 break
@@ -492,7 +409,7 @@ class PawDribbleSkillContainer(Module):
                 # instead of spinning flat-out forever.
                 next_time = now
 
-        self.stop_tool("track_ball")
+        self.stop_tool("track_subject")
 
     def _track_frame(
         self, tracker: EdgeTAMProcessor, image: Image | None
@@ -507,10 +424,10 @@ class PawDribbleSkillContainer(Module):
             return detection
         # EdgeTAM lost it: try to recover from frame motion (cheap, no VLM).
         # NOTE: this re-seeds on the largest moving blob over the whole frame,
-        # which assumes a roughly static camera. Under robot ego-motion (e.g. a
-        # Go2 body-charge) the background can dominate and re-seed onto the
-        # wrong thing -- disable via the `motion_fallback` config, or gate it on
-        # robot motion state, once the kick/approach layer drives the camera.
+        # which assumes a roughly static camera. Under robot ego-motion the
+        # background can dominate and re-seed onto the wrong thing -- disable
+        # via the `motion_fallback` config (off by default), or gate it on
+        # robot motion state once a motion layer drives the camera.
         if not self.config.motion_fallback or prev_image is None:
             return None
         bbox = detect_motion_bbox(prev_image.to_opencv(), image.to_opencv())
@@ -560,7 +477,7 @@ class PawDribbleSkillContainer(Module):
     def _metrics(self, image: Image, detection: Detection2DBBox):
         mask = getattr(detection, "mask", None)
         mask_area = None if mask is None else float(np.count_nonzero(mask))
-        return visual_metrics(BallVisualObservation(
+        return visual_metrics(VisualObservation(
             bbox=detection.bbox,
             image_width=image.width,
             image_height=image.height,
@@ -587,34 +504,36 @@ class PawDribbleSkillContainer(Module):
         self.debug_image.publish(frame)
 
     def _publish_ground_poses(
-        self, image: Image, center_px: tuple[float, float]
+        self, image: Image, bbox: tuple[float, float, float, float]
     ) -> None:
-        """Publish the tracked ball's ground position for planning.
+        """Publish the tracked subject's ground position for planning.
 
-        Back-projects the ball's image center onto the floor plane (approach
+        Back-projects the subject's ground-contact pixel -- the bottom-center
+        of its bbox, where it meets the floor -- onto the floor plane (approach
         "B") and publishes it as ``PoseStamped`` in the live ``world`` frame.
         If relocalization is publishing a prebuilt ``map`` frame, also publishes
         the same observation there. Tracking is never blocked on missing TF.
 
         Args:
             image: The frame the detection came from (supplies the timestamp).
-            center_px: ``(u, v)`` pixel center of the tracked ball.
+            bbox: ``(x1, y1, x2, y2)`` of the tracked subject in pixels.
         """
+        contact_px = ground_contact_pixel(bbox)
         self._publish_ground_pose(
             image,
-            center_px,
+            contact_px,
             self.config.world_frame_id,
             self.config.world_floor_z_m,
-            self.ball_world_pose,
+            self.subject_world_pose,
             self.config.tf_tolerance_s,
             required=True,
         )
         self._publish_ground_pose(
             image,
-            center_px,
+            contact_px,
             self.config.map_frame_id,
             self.config.map_floor_z_m,
-            self.ball_map_pose,
+            self.subject_map_pose,
             self.config.map_tf_tolerance_s,
             required=False,
         )
@@ -622,18 +541,19 @@ class PawDribbleSkillContainer(Module):
     def _publish_ground_pose(
         self,
         image: Image,
-        center_px: tuple[float, float],
+        contact_px: tuple[float, float],
         frame_id: str,
         floor_z: float,
         stream: Out[PoseStamped],
         tf_tolerance: float,
         required: bool,
     ) -> None:
-        """Publish one ground-raycasted ball pose in ``frame_id``.
+        """Publish one ground-raycasted subject pose in ``frame_id``.
 
         Args:
-            floor_z: Floor height in ``frame_id``; the raycast plane is
-                ``floor_z + ball_radius_m`` so the result is the ball center.
+            contact_px: ``(u, v)`` pixel where the subject meets the floor.
+            floor_z: Floor height in ``frame_id``; the raycast plane is exactly
+                ``floor_z`` because the contact pixel rests on the floor.
             tf_tolerance: Max age for the ``frame_id <- camera_optical`` lookup.
                 The map frame's TF is republished slowly, so it needs a looser
                 tolerance than the live odom chain.
@@ -660,10 +580,10 @@ class PawDribbleSkillContainer(Module):
             return
         self._next_pose_probe_s[frame_id] = 0.0  # present -> probe every frame
         point = pixel_to_ground_point(
-            center_px,
+            contact_px,
             self._intrinsics,
             transform.to_matrix(),
-            ground_z=floor_z + self.config.ball_radius_m,
+            ground_z=floor_z,
         )
         if point is None:
             return
@@ -678,21 +598,21 @@ class PawDribbleSkillContainer(Module):
         """Log a single warning the first time a pose frame's TF is missing."""
         if required and not self._warned_no_world_tf:
             logger.warning(
-                "No %r<-%r transform yet; ball_world_pose paused.",
+                "No %r<-%r transform yet; subject_world_pose paused.",
                 frame_id,
                 self.config.camera_optical_frame_id,
             )
             self._warned_no_world_tf = True
         elif not required and not self._warned_no_map_tf:
             logger.warning(
-                "No %r<-%r transform yet; optional ball_map_pose paused until "
-                "relocalization publishes the map frame.",
+                "No %r<-%r transform yet; optional subject_map_pose paused "
+                "until relocalization publishes the map frame.",
                 frame_id,
                 self.config.camera_optical_frame_id,
             )
             self._warned_no_map_tf = True
 
-    def _set_snapshot(self, snapshot: BallMonitorSnapshot) -> None:
+    def _set_snapshot(self, snapshot: TrackSnapshot) -> None:
         with self._lock:
             previous = self._snapshot
             self._snapshot = snapshot
@@ -703,7 +623,7 @@ class PawDribbleSkillContainer(Module):
             or snapshot.status != previous.status
             or snapshot.message != previous.message
         ):
-            self.ball_status.publish(snapshot.to_json())
+            self.subject_status.publish(snapshot.to_json())
 
     def _stop_monitoring(self) -> None:
         self._monitor_stop.set()
@@ -713,70 +633,6 @@ class PawDribbleSkillContainer(Module):
         # Join outside the lock; the loop thread takes the lock each iteration.
         if thread is not None:
             thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
-
-    # -- Internals: kick --
-
-    def _charge(self, params: KickParams) -> str:
-        self._kick_stop.clear()
-        self.kick_status.publish(
-            f"Charging the ball at {params.speed_mps:.1f} m/s for "
-            f"{params.duration_s:.1f}s."
-        )
-        # Restore whatever avoidance was configured (the value the connection
-        # applied at startup), not a blind "on" -- the operator may run with it
-        # globally off. Seed the believed state from it so an already-off run
-        # sends no toggle requests at all.
-        restore_avoidance = self.config.g.obstacle_avoidance
-        self._avoidance_enabled = restore_avoidance
-        period = 1.0 / self.config.kick_loop_hz
-        start = time.monotonic()
-        try:
-            # Let the charge reach the ball; avoidance would otherwise brake it.
-            self._set_obstacle_avoidance(False)
-            while not self._kick_stop.is_set():
-                elapsed = time.monotonic() - start
-                if elapsed >= params.duration_s:
-                    break
-                vx, wz = charge_velocity(params, elapsed)
-                self.cmd_vel.publish(
-                    Twist(
-                        linear=Vector3(vx, 0.0, 0.0),
-                        angular=Vector3(0.0, 0.0, wz),
-                    )
-                )
-                self._kick_stop.wait(period)
-        finally:
-            # Always stop the dog and restore avoidance, even if interrupted.
-            self.cmd_vel.publish(Twist.zero())
-            self._set_obstacle_avoidance(restore_avoidance)
-        interrupted = self._kick_stop.is_set()
-        message = (
-            "Kick interrupted; stopped the robot."
-            if interrupted
-            else f"Kicked the ball: charged forward at {params.speed_mps:.1f}"
-            f" m/s for {params.duration_s:.1f}s."
-        )
-        self.kick_status.publish(message)
-        return message
-
-    def _set_obstacle_avoidance(self, enabled: bool) -> None:
-        """Toggle the Go2's onboard obstacle avoidance via the connection.
-
-        Skips the request when avoidance is already in the requested state
-        (no wasted RTC round-trip), and is a no-op when no robot connection is
-        injected (off-robot runs), so the kick still publishes ``cmd_vel`` in
-        tests and simulation.
-
-        Args:
-            enabled: True restores avoidance; False disables it for the charge.
-        """
-        if self._connection is None or self._avoidance_enabled == enabled:
-            return
-        self._connection.publish_request(
-            RTC_TOPIC["OBSTACLES_AVOID"],
-            {"api_id": 1001, "parameter": {"enable": int(enabled)}},
-        )
-        self._avoidance_enabled = enabled
 
 
 def _draw_overlay(

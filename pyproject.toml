@@ -3,9 +3,9 @@ requires = ["setuptools>=70", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pawdribble"
+name = "pawtrack"
 version = "0.1.0"
-description = "PawDribble: a Unitree Go2 that dribbles a ball to a destination."
+description = "PawTrack: a Unitree Go2 that finds and tracks a described subject."
 requires-python = ">=3.10"
 dependencies = []
 

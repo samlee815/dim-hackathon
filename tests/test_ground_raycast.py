@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from pawdribble.ground_raycast import CameraIntrinsics, pixel_to_ground_point
+from pawtrack.ground_raycast import CameraIntrinsics, pixel_to_ground_point
 
 # A camera 1 m above the floor looking straight down. Optical +z (view dir)
 # maps to map -z (down); a 180-degree roll about x keeps the frame
@@ -35,8 +35,8 @@ def test_offset_pixel_projects_with_correct_ground_offset():
     assert _close(point, (1.0, 0.0, 0.0))
 
 
-def test_ground_z_offset_returns_ball_center_height():
-    # ground_z = ball radius -> returned z is the ball center, not the floor.
+def test_ground_z_offset_raises_the_intersection_plane():
+    # A non-zero ground_z lifts the intersection plane off the floor.
     point = pixel_to_ground_point((320.0, 240.0), _INTR, _LOOK_DOWN, ground_z=0.11)
     assert _close(point, (0.0, 0.0, 0.11))
 
