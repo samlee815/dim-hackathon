@@ -1,16 +1,23 @@
-"""DimOS skill container for user-described ball monitoring.
+"""DimOS skill container for PawDribble: find, track, and kick a ball.
 
-The monitor is perception-only: it does not plan, walk to the ball, or kick.
-The user describes the ball, a VLM localizes it in the current image, EdgeTAM
-tracks the selected object frame-to-frame, and the module publishes JSON status
-updates with bbox, centering, and size metrics.
+One container exposes the whole PawDribble robot behavior as DimOS skills:
 
-The decision logic (status transitions, reacquire timing) lives in the pure
-``MonitorState``; this module performs the effects (run the tracker/VLM, publish
-snapshots, draw debug frames). The control loop fails loudly -- any exception is
-logged with a traceback and surfaced as an ``error`` status rather than letting
-the worker thread die silently. When EdgeTAM drops a moving ball, a frame-motion
-fallback re-seeds the tracker before escalating to the slow VLM reacquire.
+- Perception: the user describes a ball, a VLM localizes it, EdgeTAM tracks the
+  selected object frame-to-frame, and JSON status (bbox, centering, size) is
+  published. Decision logic lives in the pure ``MonitorState``; this module runs
+  the effects (tracker/VLM, publish snapshots, debug frames). The monitor loop
+  fails loudly -- any exception is logged and surfaced as an ``error`` status
+  rather than letting the worker thread die silently. When EdgeTAM drops a
+  moving ball, a frame-motion fallback re-seeds the tracker before retrying.
+- Kick: once an upstream planner has positioned the robot behind the ball, a
+  short forward ``cmd_vel`` body-charge (the Go2 has no joint-level kick over
+  its link) drives through the ball, then stops. Velocity math is the pure
+  ``kick_profile``. Obstacle avoidance would brake the charge, so it is disabled
+  for the charge window and the configured state restored after, via the
+  injected GO2 connection (a no-op off-robot, where no connection is wired).
+
+The monitor (continuous, sensor-driven) and the kick (on-demand burst) are
+independent; they share only the module's lock.
 """
 
 from __future__ import annotations
@@ -33,10 +40,14 @@ from dimos.core.stream import In, Out
 from dimos.models.qwen.bbox import BBox
 from dimos.models.segmentation.edge_tam import EdgeTAMProcessor
 from dimos.models.vl.base import VlModel
+from dimos.msgs.geometry_msgs.Twist import Twist
+from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
 from dimos.navigation.visual.query import get_object_bbox_from_image
 from dimos.perception.detection.type.detection2d.bbox import Detection2DBBox
+from dimos.robot.unitree.go2.connection_spec import GO2ConnectionSpec
 from dimos.utils.logging_config import setup_logger
+from unitree_webrtc_connect.constants import RTC_TOPIC
 
 from pawdribble.ball_movement_motion_fallback import detect_motion_bbox
 from pawdribble.ball_movement_state import (
@@ -50,15 +61,17 @@ from pawdribble.ball_movement_state import (
     valid_bbox,
     visual_metrics,
 )
+from pawdribble.kick_profile import KickParams, charge_velocity
 from pawdribble.qwen_china import QwenChinaVlModel
 
 logger = setup_logger()
 
 
 class Config(ModuleConfig):
-    """Configuration for the described-ball monitor."""
+    """Configuration for the PawDribble skills (ball monitor + kick)."""
 
-    loop_hz: float = 15.0
+    # Ball monitoring.
+    monitor_loop_hz: float = 15.0
     max_lost_frames: int = 15  # frames without a mask before reacquiring
     reacquire_interval_frames: int = 15  # VLM retry cadence while lost
     max_reacquire_attempts: int = 5  # give up after this many failed retries
@@ -66,21 +79,34 @@ class Config(ModuleConfig):
     max_center_jump_frac: float = 2.5  # reject jumps beyond this x ball width
     max_area_factor: float = 4.0  # reject area changes beyond this factor
     stale_timeout_s: float = 2.0  # no fix longer than this -> "stale"
+    # Body-charge kick.
+    kick_speed_mps: float = 0.8  # peak forward charge speed
+    kick_duration_s: float = 0.8  # total charge time
+    kick_ramp_s: float = 0.15  # ramp-in/-out to soften the start/stop
+    kick_loop_hz: float = 20.0  # cmd_vel re-publish rate (beats the watchdog)
+    kick_max_speed_mps: float = 1.5  # hard safety clamp on forward speed
+    kick_max_duration_s: float = 2.0  # hard safety clamp on charge duration
+    kick_max_yaw_radps: float = 1.0  # hard safety clamp on yaw
 
 
-class BallMonitorSkillContainer(Module):
-    """Monitor a described ball with VLM acquisition and EdgeTAM tracking."""
+class PawDribbleSkillContainer(Module):
+    """Find, track, and body-charge a user-described ball."""
 
     config: Config
 
     color_image: In[Image]
     ball_status: Out[str]  # JSON status (LCM diagnostic stream)
     debug_image: Out[Image]  # annotated camera frame (shows in Rerun)
+    cmd_vel: Out[Twist]  # body-charge velocity to the robot
+    kick_status: Out[str]  # human-readable kick diagnostics
+    # Injected on the robot stack; None off-robot (avoidance toggle skipped).
+    _connection: GO2ConnectionSpec | None = None
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._lock = threading.RLock()
-        self._stop = threading.Event()
+        self._monitor_stop = threading.Event()
+        self._kick_stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._latest_image: Image | None = None
         self._prev_image: Image | None = None
@@ -95,6 +121,9 @@ class BallMonitorSkillContainer(Module):
         self._snapshot = self._state.snapshot
         self._vl_model: VlModel | None = None
         self._tracker: EdgeTAMProcessor | None = None
+        self._kicking = False
+        # Believed onboard avoidance state, so we skip redundant RTC requests.
+        self._avoidance_enabled: bool | None = None
 
     @rpc
     def start(self) -> None:
@@ -105,6 +134,7 @@ class BallMonitorSkillContainer(Module):
 
     @rpc
     def stop(self) -> None:
+        self._kick_stop.set()
         self._stop_monitoring()
         with self._lock:
             tracker = self._tracker
@@ -116,6 +146,8 @@ class BallMonitorSkillContainer(Module):
         if vl_model is not None:
             vl_model.stop()
         super().stop()
+
+    # -- Perception skills --
 
     @skill
     def track_ball(
@@ -195,6 +227,77 @@ class BallMonitorSkillContainer(Module):
             snapshot = self._snapshot
         return snapshot.to_json()
 
+    # -- Kick skills --
+
+    @skill
+    def kick_ball(
+        self,
+        speed_mps: float | None = None,
+        duration_s: float | None = None,
+    ) -> str:
+        """Kick the ball forward with a body-charge.
+
+        Call this only when the robot is already positioned directly behind the
+        ball and facing it -- the planner handles the approach and aiming. The
+        robot drives a short forward burst through the ball and then stops; it
+        does not steer, so do not call this until the ball is centered ahead.
+
+        Args:
+            speed_mps: Optional peak charge speed override (m/s).
+            duration_s: Optional charge duration override (seconds).
+
+        Returns:
+            Status text describing the kick or why it was refused.
+        """
+        with self._lock:
+            if self._kicking:
+                return "Already kicking; ignoring the new kick request."
+            self._kicking = True
+        speed = self.config.kick_speed_mps if speed_mps is None else speed_mps
+        duration = (
+            self.config.kick_duration_s if duration_s is None else duration_s
+        )
+        try:
+            params = KickParams(
+                speed_mps=speed,
+                duration_s=duration,
+                ramp_s=self.config.kick_ramp_s,
+                max_speed_mps=self.config.kick_max_speed_mps,
+                max_duration_s=self.config.kick_max_duration_s,
+                max_yaw_radps=self.config.kick_max_yaw_radps,
+            )
+        except ValueError as err:
+            logger.error("kick_ball: invalid parameters: %s", err)
+            with self._lock:
+                self._kicking = False
+            return f"Invalid kick parameters: {err}"
+        try:
+            return self._charge(params)
+        finally:
+            with self._lock:
+                self._kicking = False
+
+    @skill
+    def stop_kick(self) -> str:
+        """Stop an in-progress body-charge kick and publish zero velocity.
+
+        Call this when the user asks to cancel, stop, abort, or interrupt a
+        kick. It is safe to call when no kick is running.
+
+        Returns:
+            Status text describing whether a kick was stopped.
+        """
+        with self._lock:
+            was_kicking = self._kicking
+        self._kick_stop.set()
+        self.cmd_vel.publish(Twist.zero())
+        if was_kicking:
+            self.kick_status.publish("Kick stop requested; stopping the robot.")
+            return "Stopping the kick."
+        return "No kick is currently running."
+
+    # -- Internals: perception --
+
     def _on_color_image(self, image: Image) -> None:
         with self._lock:
             self._latest_image = image
@@ -253,7 +356,7 @@ class BallMonitorSkillContainer(Module):
         self.start_tool("track_ball")
         with self._lock:
             self._prev_image = None
-            self._stop.clear()
+            self._monitor_stop.clear()
             self._thread = threading.Thread(
                 target=self._monitor_loop,
                 args=(tracker, description),
@@ -272,10 +375,10 @@ class BallMonitorSkillContainer(Module):
         tracker: EdgeTAMProcessor,
         description: str,
     ) -> None:
-        period = 1.0 / self.config.loop_hz
+        period = 1.0 / self.config.monitor_loop_hz
         next_time = time.monotonic()
 
-        while not self._stop.is_set():
+        while not self._monitor_stop.is_set():
             next_time += period
             try:
                 with self._lock:
@@ -309,7 +412,7 @@ class BallMonitorSkillContainer(Module):
             now = time.monotonic()
             sleep_duration = next_time - now
             if sleep_duration > 0:
-                self._stop.wait(sleep_duration)
+                self._monitor_stop.wait(sleep_duration)
             else:
                 # Fell behind (e.g. a slow VLM reacquire); drop the banked lag
                 # instead of spinning flat-out forever.
@@ -423,13 +526,77 @@ class BallMonitorSkillContainer(Module):
             self.ball_status.publish(snapshot.to_json())
 
     def _stop_monitoring(self) -> None:
-        self._stop.set()
+        self._monitor_stop.set()
         with self._lock:
             thread = self._thread
             self._thread = None
         # Join outside the lock; the loop thread takes the lock each iteration.
         if thread is not None:
             thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+
+    # -- Internals: kick --
+
+    def _charge(self, params: KickParams) -> str:
+        self._kick_stop.clear()
+        self.kick_status.publish(
+            f"Charging the ball at {params.speed_mps:.1f} m/s for "
+            f"{params.duration_s:.1f}s."
+        )
+        # Restore whatever avoidance was configured (the value the connection
+        # applied at startup), not a blind "on" -- the operator may run with it
+        # globally off. Seed the believed state from it so an already-off run
+        # sends no toggle requests at all.
+        restore_avoidance = self.config.g.obstacle_avoidance
+        self._avoidance_enabled = restore_avoidance
+        period = 1.0 / self.config.kick_loop_hz
+        start = time.monotonic()
+        try:
+            # Let the charge reach the ball; avoidance would otherwise brake it.
+            self._set_obstacle_avoidance(False)
+            while not self._kick_stop.is_set():
+                elapsed = time.monotonic() - start
+                if elapsed >= params.duration_s:
+                    break
+                vx, wz = charge_velocity(params, elapsed)
+                self.cmd_vel.publish(
+                    Twist(
+                        linear=Vector3(vx, 0.0, 0.0),
+                        angular=Vector3(0.0, 0.0, wz),
+                    )
+                )
+                self._kick_stop.wait(period)
+        finally:
+            # Always stop the dog and restore avoidance, even if interrupted.
+            self.cmd_vel.publish(Twist.zero())
+            self._set_obstacle_avoidance(restore_avoidance)
+        interrupted = self._kick_stop.is_set()
+        message = (
+            "Kick interrupted; stopped the robot."
+            if interrupted
+            else f"Kicked the ball: charged forward at {params.speed_mps:.1f}"
+            f" m/s for {params.duration_s:.1f}s."
+        )
+        self.kick_status.publish(message)
+        return message
+
+    def _set_obstacle_avoidance(self, enabled: bool) -> None:
+        """Toggle the Go2's onboard obstacle avoidance via the connection.
+
+        Skips the request when avoidance is already in the requested state
+        (no wasted RTC round-trip), and is a no-op when no robot connection is
+        injected (off-robot runs), so the kick still publishes ``cmd_vel`` in
+        tests and simulation.
+
+        Args:
+            enabled: True restores avoidance; False disables it for the charge.
+        """
+        if self._connection is None or self._avoidance_enabled == enabled:
+            return
+        self._connection.publish_request(
+            RTC_TOPIC["OBSTACLES_AVOID"],
+            {"api_id": 1001, "parameter": {"enable": int(enabled)}},
+        )
+        self._avoidance_enabled = enabled
 
 
 def _draw_overlay(

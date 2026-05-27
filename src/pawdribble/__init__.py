@@ -1,7 +1,7 @@
 """PawDribble -- pure helpers for the Go2 ball-monitoring demo.
 
 Only dependency-free modules are exported here, so importing :mod:`pawdribble`
-stays light. The DimOS glue lives in :mod:`pawdribble.ball_movement_monitor`,
+stays light. The DimOS glue lives in :mod:`pawdribble.skill_container`,
 imported directly by the launcher and not re-exported.
 """
 

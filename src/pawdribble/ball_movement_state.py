@@ -9,7 +9,7 @@ Two cohesive, dependency-free concerns for following a ball frame to frame:
   snapshot, applying a motion-aware drift gate and deciding when to reacquire
   (:class:`BallMonitorSnapshot`, :class:`MonitorParams`, :class:`MonitorState`).
 
-No DimOS imports -- unit tested. The DimOS ``BallMonitorSkillContainer``
+No DimOS imports -- unit tested. The DimOS ``PawDribbleSkillContainer``
 performs the effects (run the tracker/VLM, publish snapshots) and feeds this
 machine each frame's result via :meth:`MonitorState.observe`; the machine
 decides the status and what to do next.

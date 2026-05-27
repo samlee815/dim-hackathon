@@ -44,8 +44,8 @@ from dimos.core.global_config import global_config
 from dimos.hardware.sensors.camera.module import CameraModule
 from dimos.visualization.vis_module import vis_module
 
-from pawdribble.ball_movement_monitor import BallMonitorSkillContainer
 from pawdribble.image_source import FileImageSource
+from pawdribble.skill_container import PawDribbleSkillContainer
 from pawdribble.system_prompt import PAWDRIBBLE_PROMPT
 
 
@@ -64,15 +64,19 @@ def build_blueprint(
     Returns:
         The composed blueprint ready for ModuleCoordinator.build.
     """
-    model = os.environ.get("PAWDRIBBLE_MODEL", "openai:gpt-5.1")
-    agent = McpClient.blueprint(model=model, system_prompt=PAWDRIBBLE_PROMPT)
-    monitor = BallMonitorSkillContainer.blueprint()
+    container = PawDribbleSkillContainer.blueprint()
     if robot:
         base = importlib.import_module(
             "dimos.robot.unitree.go2.blueprints.agentic.unitree_go2_agentic"
         ).unitree_go2_agentic
-        return autoconnect(base, monitor, agent)
-    parts = [McpServer.blueprint(), monitor, agent]
+        # The agentic base already bundles the MCP server + agent, so we just
+        # add our skill container (no second McpClient). The prompt-configured
+        # agent lives in the registered `pawdribble-agentic` blueprint; this
+        # ``--robot`` mode is a quick on-robot test of the standalone launcher.
+        return autoconnect(base, container)
+    model = os.environ.get("PAWDRIBBLE_MODEL", "openai:gpt-5.1")
+    agent = McpClient.blueprint(model=model, system_prompt=PAWDRIBBLE_PROMPT)
+    parts = [McpServer.blueprint(), container, agent]
     if source:
         parts.append(FileImageSource.blueprint(path=source))
         parts.append(vis_module(viewer_backend=global_config.viewer))
