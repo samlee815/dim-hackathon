@@ -9,8 +9,10 @@ so no GPU, robot, or network is needed.
 import json
 
 import numpy as np
+import pytest
 
 from pawdribble.ball_movement_state import BallTrackMetrics
+from pawdribble.ground_raycast import CameraIntrinsics
 from pawdribble.skill_container import PawDribbleSkillContainer
 
 
@@ -62,12 +64,46 @@ class _FakeConnection:
         return {}
 
 
+class _FakeTransform:
+    """Transform stand-in exposing the matrix API used by the raycast."""
+
+    def __init__(self, matrix):
+        self._matrix = matrix
+
+    def to_matrix(self):
+        return self._matrix
+
+
+class _FakeTf:
+    """Frame lookup table for pose-publishing tests."""
+
+    def __init__(self, transforms):
+        self._transforms = transforms
+
+    def get(self, frame_id, _child_frame_id, **_kwargs):
+        return self._transforms.get(frame_id)
+
+
+def _look_down_transform(x=0.0, y=0.0, z=1.0):
+    transform = np.array(
+        [
+            [1.0, 0.0, 0.0, x],
+            [0.0, -1.0, 0.0, y],
+            [0.0, 0.0, -1.0, z],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    return _FakeTransform(transform)
+
+
 def _container(init_count=0):
     container = PawDribbleSkillContainer()
     container.ball_status = _Recorder()
     container.debug_image = _Recorder()
     container.cmd_vel = _Recorder()
     container.kick_status = _Recorder()
+    container.ball_world_pose = _Recorder()
+    container.ball_map_pose = _Recorder()
     container._latest_image = _FakeImage()
     container._tracker = _FakeTracker(init_count)
     return container
@@ -138,6 +174,83 @@ def test_start_then_stop_publishes_stopped():
     statuses = _statuses(container)
     assert "acquiring" in statuses and "stopped" in statuses
     assert container._thread is None or not container._thread.is_alive()
+
+
+def test_ground_pose_publishes_world_and_optional_map():
+    container = _container()
+    container._intrinsics = CameraIntrinsics(
+        fx=100.0, fy=100.0, cx=320.0, cy=240.0)
+    container._tf = _FakeTf({
+        "world": _look_down_transform(x=1.0),
+        "map": _look_down_transform(x=10.0),
+    })
+
+    container._publish_ground_poses(_FakeImage(), (320.0, 240.0))
+
+    assert len(container.ball_world_pose.msgs) == 1
+    assert len(container.ball_map_pose.msgs) == 1
+    assert container.ball_world_pose.msgs[0].frame_id == "world"
+    assert container.ball_map_pose.msgs[0].frame_id == "map"
+    assert tuple(container.ball_world_pose.msgs[0].position) == pytest.approx(
+        (1.0, 0.0, 0.11))
+    assert tuple(container.ball_map_pose.msgs[0].position) == pytest.approx(
+        (10.0, 0.0, 0.11))
+
+
+def test_ground_pose_keeps_world_when_map_tf_missing():
+    container = _container()
+    container._intrinsics = CameraIntrinsics(
+        fx=100.0, fy=100.0, cx=320.0, cy=240.0)
+    container._tf = _FakeTf({"world": _look_down_transform()})
+
+    container._publish_ground_poses(_FakeImage(), (320.0, 240.0))
+
+    assert len(container.ball_world_pose.msgs) == 1
+    assert container.ball_world_pose.msgs[0].frame_id == "world"
+    assert container.ball_map_pose.msgs == []
+
+
+def test_absent_map_tf_lookup_is_throttled_not_per_frame():
+    # tf.get logs on every miss, so a missing map frame must not be probed each
+    # tracked frame. World is present (probed every frame); map is absent
+    # (probed once, then throttled).
+    container = _container()
+    container._intrinsics = CameraIntrinsics(
+        fx=100.0, fy=100.0, cx=320.0, cy=240.0)
+    calls = {}
+
+    class _CountingTf:
+        def get(self, frame_id, _child, **_kwargs):
+            calls[frame_id] = calls.get(frame_id, 0) + 1
+            return _look_down_transform() if frame_id == "world" else None
+
+    container._tf = _CountingTf()
+    for _ in range(5):
+        container._publish_ground_poses(_FakeImage(), (320.0, 240.0))
+
+    assert calls["world"] == 5  # present -> probed every frame
+    assert calls["map"] == 1  # absent -> one probe, then throttled
+    assert container.ball_map_pose.msgs == []
+
+
+def test_map_lookup_uses_looser_tolerance_than_world():
+    # The map<-world TF is republished slowly, so the map lookup must tolerate
+    # a staler transform than the live odom chain, or it pauses mid-interval.
+    container = _container()
+    container._intrinsics = CameraIntrinsics(
+        fx=100.0, fy=100.0, cx=320.0, cy=240.0)
+    seen = {}
+
+    class _CaptureTf:
+        def get(self, frame_id, _child, *, time_point=None, time_tolerance=None):
+            seen[frame_id] = time_tolerance
+            return _look_down_transform()
+
+    container._tf = _CaptureTf()
+    container._publish_ground_poses(_FakeImage(), (320.0, 240.0))
+
+    assert seen["map"] > seen["world"]
+    assert seen["map"] >= 2.0  # must exceed the relocalization publish interval
 
 
 # -- Kick --

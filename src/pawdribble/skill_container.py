@@ -40,8 +40,10 @@ from dimos.core.stream import In, Out
 from dimos.models.qwen.bbox import BBox
 from dimos.models.segmentation.edge_tam import EdgeTAMProcessor
 from dimos.models.vl.base import VlModel
+from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
+from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo
 from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
 from dimos.navigation.visual.query import get_object_bbox_from_image
 from dimos.perception.detection.type.detection2d.bbox import Detection2DBBox
@@ -61,6 +63,7 @@ from pawdribble.ball_movement_state import (
     valid_bbox,
     visual_metrics,
 )
+from pawdribble.ground_raycast import CameraIntrinsics, pixel_to_ground_point
 from pawdribble.kick_profile import KickParams, charge_velocity
 from pawdribble.qwen_china import QwenChinaVlModel
 
@@ -87,6 +90,31 @@ class Config(ModuleConfig):
     kick_max_speed_mps: float = 1.5  # hard safety clamp on forward speed
     kick_max_duration_s: float = 2.0  # hard safety clamp on charge duration
     kick_max_yaw_radps: float = 1.0  # hard safety clamp on yaw
+    # Ball position (ground-plane raycast, approach "B"). The tracked ball
+    # pixel is back-projected to the floor in the live world frame for the
+    # planner. If relocalization is live, the same point is also published in
+    # the stable map frame.
+    camera_info: CameraInfo | None = None  # intrinsics; auto-resolved if None
+    # Ball-center height above the floor, assuming a roughly 22 cm ball.
+    ball_radius_m: float = 0.11
+    # Floor height (z) in each frame, kept separate from the ball radius so a
+    # frame whose z=0 is not the floor is a config change, not a logic change.
+    # The raycast plane is ``floor_z + ball_radius_m`` (the ball center).
+    world_floor_z_m: float = 0.0  # floor z in the live odometry frame
+    map_floor_z_m: float = 0.0  # floor z in the prebuilt-map frame
+    world_frame_id: str = "world"  # always-on live odometry frame
+    map_frame_id: str = "map"  # optional prebuilt-map frame
+    camera_optical_frame_id: str = "camera_optical"
+    tf_tolerance_s: float = 1.0  # max age for the live world/odom TF lookup
+    # The map<-world TF is republished only every ~2 s by relocalization, so the
+    # map lookup needs a looser tolerance than the live odom chain or it would
+    # pause for the back half of each interval even when relocalization is
+    # healthy. Must exceed the relocalization publish interval (2.0 s).
+    map_tf_tolerance_s: float = 3.0
+    # While a pose frame's TF is absent, retry its lookup at most this often
+    # rather than every tracked frame -- ``tf.get`` warns on each miss, which
+    # would otherwise flood logs at the monitor loop rate.
+    pose_probe_interval_s: float = 2.0
 
 
 class PawDribbleSkillContainer(Module):
@@ -99,6 +127,8 @@ class PawDribbleSkillContainer(Module):
     debug_image: Out[Image]  # annotated camera frame (shows in Rerun)
     cmd_vel: Out[Twist]  # body-charge velocity to the robot
     kick_status: Out[str]  # human-readable kick diagnostics
+    ball_world_pose: Out[PoseStamped]  # ball position in live odometry frame
+    ball_map_pose: Out[PoseStamped]  # optional ball position in premap frame
     # Injected on the robot stack; None off-robot (avoidance toggle skipped).
     _connection: GO2ConnectionSpec | None = None
 
@@ -124,6 +154,48 @@ class PawDribbleSkillContainer(Module):
         self._kicking = False
         # Believed onboard avoidance state, so we skip redundant RTC requests.
         self._avoidance_enabled: bool | None = None
+        self._intrinsics = self._resolve_intrinsics()
+        self._warned_no_world_tf = False
+        self._warned_no_map_tf = False
+        # Monotonic time before which a pose frame's TF lookup is skipped, per
+        # frame_id, to throttle retries while that frame is absent.
+        self._next_pose_probe_s: dict[str, float] = {}
+
+    def _resolve_intrinsics(self) -> CameraIntrinsics | None:
+        """Pinhole intrinsics for the ground-plane raycast.
+
+        Prefer an explicit ``config.camera_info``; otherwise use the static
+        intrinsics of whichever connection backs this run (sim or the real
+        Go2), so the raycast works without extra blueprint wiring. Returns
+        ``None`` if no usable intrinsics are found (pose publishing then
+        no-ops).
+        """
+        camera_info = self.config.camera_info
+        if camera_info is None:
+            simulation = self.config.g.simulation
+            if simulation == "mujoco":
+                from dimos.robot.unitree.mujoco_connection import (
+                    MujocoConnection,
+                )
+
+                camera_info = MujocoConnection.camera_info_static
+            elif simulation == "dimsim":
+                from dimos.robot.unitree.dimsim_connection import (
+                    DimSimConnection,
+                )
+
+                camera_info = DimSimConnection.camera_info_static
+            else:
+                from dimos.robot.unitree.go2.connection import GO2Connection
+
+                camera_info = GO2Connection.camera_info_static
+        if (
+            camera_info is None
+            or len(camera_info.K) != 9
+            or camera_info.K[0] <= 0.0
+        ):
+            return None
+        return CameraIntrinsics.from_k(list(camera_info.K))
 
     @rpc
     def start(self) -> None:
@@ -399,6 +471,8 @@ class PawDribbleSkillContainer(Module):
                 if image is not None:
                     drawn = detection if snapshot.status == "tracking" else None
                     self._publish_debug(description, image, drawn)
+                    if drawn is not None and snapshot.center_px is not None:
+                        self._publish_ground_poses(image, snapshot.center_px)
             except Exception:  # noqa: BLE001 - thread-boundary guard
                 # Deliberately broad: this is the worker-thread top level. Fail
                 # LOUDLY (full traceback + an `error` status) instead of letting
@@ -511,6 +585,112 @@ class PawDribbleSkillContainer(Module):
                 image, None, f"searching: {description}", (0, 0, 255)
             )
         self.debug_image.publish(frame)
+
+    def _publish_ground_poses(
+        self, image: Image, center_px: tuple[float, float]
+    ) -> None:
+        """Publish the tracked ball's ground position for planning.
+
+        Back-projects the ball's image center onto the floor plane (approach
+        "B") and publishes it as ``PoseStamped`` in the live ``world`` frame.
+        If relocalization is publishing a prebuilt ``map`` frame, also publishes
+        the same observation there. Tracking is never blocked on missing TF.
+
+        Args:
+            image: The frame the detection came from (supplies the timestamp).
+            center_px: ``(u, v)`` pixel center of the tracked ball.
+        """
+        self._publish_ground_pose(
+            image,
+            center_px,
+            self.config.world_frame_id,
+            self.config.world_floor_z_m,
+            self.ball_world_pose,
+            self.config.tf_tolerance_s,
+            required=True,
+        )
+        self._publish_ground_pose(
+            image,
+            center_px,
+            self.config.map_frame_id,
+            self.config.map_floor_z_m,
+            self.ball_map_pose,
+            self.config.map_tf_tolerance_s,
+            required=False,
+        )
+
+    def _publish_ground_pose(
+        self,
+        image: Image,
+        center_px: tuple[float, float],
+        frame_id: str,
+        floor_z: float,
+        stream: Out[PoseStamped],
+        tf_tolerance: float,
+        required: bool,
+    ) -> None:
+        """Publish one ground-raycasted ball pose in ``frame_id``.
+
+        Args:
+            floor_z: Floor height in ``frame_id``; the raycast plane is
+                ``floor_z + ball_radius_m`` so the result is the ball center.
+            tf_tolerance: Max age for the ``frame_id <- camera_optical`` lookup.
+                The map frame's TF is republished slowly, so it needs a looser
+                tolerance than the live odom chain.
+            required: Whether this frame should always be present (live world)
+                vs optional (prebuilt map); only changes the warning wording.
+        """
+        if self._intrinsics is None:
+            return
+        # Throttle retries while this frame's TF is absent: tf.get logs on every
+        # miss, so probing each tracked frame would flood logs at loop rate.
+        now = time.monotonic()
+        if now < self._next_pose_probe_s.get(frame_id, 0.0):
+            return
+        transform = self.tf.get(
+            frame_id,
+            self.config.camera_optical_frame_id,
+            time_point=image.ts,
+            time_tolerance=tf_tolerance,
+        )
+        if transform is None:
+            self._next_pose_probe_s[frame_id] = (
+                now + self.config.pose_probe_interval_s)
+            self._warn_missing_tf_once(frame_id, required)
+            return
+        self._next_pose_probe_s[frame_id] = 0.0  # present -> probe every frame
+        point = pixel_to_ground_point(
+            center_px,
+            self._intrinsics,
+            transform.to_matrix(),
+            ground_z=floor_z + self.config.ball_radius_m,
+        )
+        if point is None:
+            return
+        stream.publish(PoseStamped(
+            ts=image.ts,
+            frame_id=frame_id,
+            position=list(point),
+            orientation=[0.0, 0.0, 0.0, 1.0],
+        ))
+
+    def _warn_missing_tf_once(self, frame_id: str, required: bool) -> None:
+        """Log a single warning the first time a pose frame's TF is missing."""
+        if required and not self._warned_no_world_tf:
+            logger.warning(
+                "No %r<-%r transform yet; ball_world_pose paused.",
+                frame_id,
+                self.config.camera_optical_frame_id,
+            )
+            self._warned_no_world_tf = True
+        elif not required and not self._warned_no_map_tf:
+            logger.warning(
+                "No %r<-%r transform yet; optional ball_map_pose paused until "
+                "relocalization publishes the map frame.",
+                frame_id,
+                self.config.camera_optical_frame_id,
+            )
+            self._warned_no_map_tf = True
 
     def _set_snapshot(self, snapshot: BallMonitorSnapshot) -> None:
         with self._lock:
