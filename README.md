@@ -1,15 +1,16 @@
-# PawDribble
+# PawTrack
 
-A Unitree Go2 hackathon project for **dribbling a user-described ball to a
-destination**, built on [DimOS](https://github.com/dimensionalOS/dimos).
+A Unitree Go2 hackathon project for a **greeter dog**: the robot wanders a room,
+finds a person sitting on a chair, circles to face them from the front, and
+waves "hi" — built on [DimOS](https://github.com/dimensionalOS/dimos).
 
-This repo currently packages the perception and final kick slice as DimOS
-skills: the user describes a ball, the robot identifies that specific object,
-tracks it frame-to-frame, streams bbox / centering / apparent-size metrics, and
-can body-charge through the ball once a teammate-owned planner has positioned
-the robot behind it.
+This repo currently packages the **perception** slice as DimOS skills: the user
+(or the agent) describes a subject — by default "a person sitting on a chair" —
+the robot identifies it, tracks it frame-to-frame, streams bbox / centering /
+apparent-size metrics, and publishes the subject's position on the floor for a
+planner. The container is perception only; it never drives the robot.
 
-- **Design:** [`docs/pawdribble-design.md`](./docs/pawdribble-design.md)
+- **Design:** [`docs/pawtrack-design.md`](./docs/pawtrack-design.md)
 - **Build plan:** [`plan.md`](./plan.md)
 - **Environment (native Ubuntu + GPU):** [`SETUP.md`](./SETUP.md)
 - **GPU host setup:** [`docs/gpu-host-setup.md`](./docs/gpu-host-setup.md)
@@ -20,46 +21,46 @@ the robot behind it.
 
 ## Active Slice
 
-- **Skill container:** `PawDribbleSkillContainer` (one container, perception +
-  kick)
-  - `track_ball(description)`
-  - `ball_tracking_status()`
-  - `stop_tracking_ball()`
-  - `kick_ball(speed_mps=None, duration_s=None)`
-  - `stop_kick()`
-- **Perception strategy:** VLM acquisition for the described ball, then EdgeTAM
-  tracking for frame-to-frame monitoring.
-- **Output:** JSON status on `/ball_status` with bbox, center pixel,
-  image-center error, bbox area, optional mask area, and age.
+- **Skill container:** `PawTrackSkillContainer` (perception only)
+  - `track_subject(description="a person sitting on a chair", ...)`
+  - `tracking_status()`
+  - `stop_tracking()`
+- **Perception strategy:** VLM acquisition for the described subject, then
+  EdgeTAM tracking for frame-to-frame monitoring.
+- **Output:** JSON status on `/subject_status` (bbox, center pixel, image-center
+  error, bbox area, optional mask area, age), plus the subject's floor position
+  on `/subject_world_pose` (and `/subject_map_pose` with relocalization).
 
 ## Teammate Seam
 
-The planner / navigation / body-charge layer should consume the monitoring
-stream (`/ball_status`, `/debug_image`) later. The current launcher exposes the
-final `kick_ball` body-charge, but it does not plan routes, approach the ball,
-or aim the robot.
+The motion / navigation layer (wander, approach, orbit-to-front, greet) is built
+separately and consumes the perception streams (`/subject_status`,
+`/debug_image`, `/subject_world_pose`). The current container only perceives and
+locates the subject; it does not plan routes, approach, or move the robot.
 
 ## Layout
 
-- `src/pawdribble/skill_container.py` — the DimOS skill container
-  (`PawDribbleSkillContainer`): perception skills (VLM acquire + EdgeTAM track)
-  plus the `kick_ball` body-charge and `stop_kick`.
-- `src/pawdribble/ball_movement_state.py` — pure tracking logic: bbox/size/
-  centering metrics plus the monitor state machine (status, drift gate,
-  reacquire).
-- `src/pawdribble/ball_movement_motion_fallback.py` — pure frame-diff fallback
-  that re-seeds the tracker when EdgeTAM drops a moving ball.
-- `src/pawdribble/kick_profile.py` — pure ramped charge-velocity profile.
-- `src/pawdribble/image_source.py` — file/video frame source for no-robot runs.
-- `src/pawdribble/system_prompt.py` — agent prompt: see the ball, then kick it.
-- `scripts/run_pawdribble.py` — launcher: `--source FILE` / `--camera` run the
-  pipeline end-to-end with no robot (Rerun viewer included), `--robot` at the
-  venue (the kick toggles obstacle avoidance off only for the charge window).
+- `src/pawtrack/skill_container.py` — the DimOS skill container
+  (`PawTrackSkillContainer`): perception skills (VLM acquire + EdgeTAM track)
+  and the ground-pose raycast. Perception only; no motion.
+- `src/pawtrack/track_state.py` — pure tracking logic: bbox/size/centering
+  metrics, the ground-contact pixel, and the monitor state machine (status,
+  drift gate, reacquire).
+- `src/pawtrack/motion_fallback.py` — pure frame-diff fallback that re-seeds the
+  tracker on a miss (off by default; the camera moves with the dog).
+- `src/pawtrack/ground_raycast.py` — pure pixel-to-floor raycast for the
+  subject's absolute position.
+- `src/pawtrack/qwen_china.py` — Qwen-VL on the Alibaba China DashScope endpoint.
+- `src/pawtrack/image_source.py` — file/video frame source for no-robot runs.
+- `src/pawtrack/system_prompt.py` — agent prompt: find and track the subject.
+- `scripts/run_pawtrack.py` — launcher: `--source FILE` / `--camera` run the
+  pipeline end-to-end with no robot (Rerun viewer included), `--robot` on the
+  real Go2.
 
 ## Real Robot Agentic Runs
 
 All real-robot runs are native Ubuntu DimOS runs from this repo, with the
-PawDribble package on `PYTHONPATH`:
+PawTrack package on `PYTHONPATH`:
 
 ```bash
 export REPO_ROOT="$(pwd)"
@@ -79,42 +80,42 @@ the blueprint file must be copied into the DimOS source tree and the registry
 must be regenerated:
 
 ```bash
-cp integration/pawdribble_agentic.py \
+cp integration/pawtrack_agentic.py \
   "$DIMOS_HOME/dimos/robot/unitree/go2/blueprints/agentic/"
 
 pytest -o addopts="" \
   "$DIMOS_HOME/dimos/robot/test_all_blueprints_generation.py"
 ```
 
-### 2. Run PawDribble Agentic
+### 2. Run PawTrack Agentic
 
-This is the normal real-robot mode. It includes the Go2 agentic stack,
-PawDribble prompt, PawDribble tools, and live ball tracking. It publishes
-`/ball_world_pose` in the current odometry `world` frame. It does not require a
-prebuilt map.
+This is the normal real-robot mode. It includes the Go2 agentic stack, the
+PawTrack prompt, the PawTrack tools, and live subject tracking. It publishes
+`/subject_world_pose` in the current odometry `world` frame. It does not require
+a prebuilt map.
 
 ```bash
-PYTHONPATH=src PAWDRIBBLE_MODEL=openai:deepseek-chat \
-  dimos --robot-ip "$ROBOT_IP" --rerun-open web run pawdribble-agentic
+PYTHONPATH=src PAWTRACK_MODEL=openai:deepseek-chat \
+  dimos --robot-ip "$ROBOT_IP" --rerun-open web run pawtrack-agentic
 ```
 
 Expected planner-facing streams:
 
 ```text
-/ball_status       JSON tracking diagnostics
-/debug_image       annotated camera frame
-/ball_world_pose   PoseStamped in live world/odom frame
-/ball_map_pose     paused unless relocalization is running
+/subject_status       JSON tracking diagnostics
+/debug_image          annotated camera frame
+/subject_world_pose   PoseStamped in live world/odom frame
+/subject_map_pose     paused unless relocalization is running
 ```
 
 ### 3. Optional: Register Map-Relocalized Agentic
 
 Use this only when you have exported a prebuilt `.pc2.lcm` map and want
-`/ball_map_pose` in the stable `map` frame. The normal `pawdribble-agentic`
+`/subject_map_pose` in the stable `map` frame. The normal `pawtrack-agentic`
 blueprint is left unchanged to avoid surprising behavior.
 
 ```bash
-cp integration/pawdribble_agentic_relocalization.py \
+cp integration/pawtrack_agentic_relocalization.py \
   "$DIMOS_HOME/dimos/robot/unitree/go2/blueprints/agentic/"
 
 pytest -o addopts="" \
@@ -124,18 +125,18 @@ pytest -o addopts="" \
 Run with a premap:
 
 ```bash
-PYTHONPATH=src PAWDRIBBLE_MODEL=openai:deepseek-chat \
+PYTHONPATH=src PAWTRACK_MODEL=openai:deepseek-chat \
   dimos --robot-ip "$ROBOT_IP" --rerun-open web \
-  run pawdribble-agentic-relocalization \
+  run pawtrack-agentic-relocalization \
   -o relocalizationmodule.map_file="<premap_name>"
 ```
 
 Rules:
 
-- `ball_world_pose` is always the primary pose for current-run planning.
-- `ball_map_pose` only publishes when `RelocalizationModule` is present and
+- `subject_world_pose` is always the primary pose for current-run planning.
+- `subject_map_pose` only publishes when `RelocalizationModule` is present and
   `relocalizationmodule.map_file` points to a valid premap.
-- If `map_file` is missing, relocalization disables itself and `ball_map_pose`
+- If `map_file` is missing, relocalization disables itself and `subject_map_pose`
   stays paused.
 
 ### 4. Verify The Agentic Tools
@@ -144,15 +145,13 @@ Use direct MCP calls first, before relying on the LLM:
 
 ```bash
 dimos mcp list-tools
-dimos mcp call track_ball --arg description="the red ball"
-dimos mcp call ball_tracking_status
-dimos mcp call stop_tracking_ball
-dimos mcp call kick_ball --arg speed_mps=0.8 --arg duration_s=0.8
-dimos mcp call stop_kick
+dimos mcp call track_subject --arg description="a person sitting on a chair"
+dimos mcp call tracking_status
+dimos mcp call stop_tracking
 ```
 
-The tool list should include `track_ball`, `ball_tracking_status`,
-`stop_tracking_ball`, `kick_ball`, and `stop_kick`.
+The tool list should include `track_subject`, `tracking_status`, and
+`stop_tracking`.
 
 ## Run Tests
 

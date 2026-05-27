@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Guidance for AI agents and humans writing code in this repo (PawDribble — a DimOS /
+Guidance for AI agents and humans writing code in this repo (PawTrack — a DimOS /
 Unitree Go2 hackathon project). Read this before writing or editing Python.
 
 ## Python Style Guide
@@ -42,7 +42,7 @@ Names describe intent. Avoid single-letter names except short-lived loop indices
 - Don't annotate `self`, `cls`, or `__init__`'s return.
 - One parameter per line for long signatures.
 - Use a `TYPE_CHECKING` block for type-only imports. `from __future__ import annotations`
-  at the top of modules is the existing convention in `src/pawdribble`.
+  at the top of modules is the existing convention in `src/pawtrack`.
 
 ### Docstrings (PEP 257, Google format)
 - Triple double-quotes `"""`. Summary line, blank line, then details.
@@ -65,7 +65,7 @@ Names describe intent. Avoid single-letter names except short-lived loop indices
 - Avoid mutable global state; module-level constants are fine.
 - Use `with` for file/resource management.
 - Prefer pure functions and dependency injection (pass timestamps, robot refs in) so
-  logic is testable without hardware — the pure-logic pattern in `dribble_planner.py`.
+  logic is testable without hardware — the pure-logic pattern in `track_state.py`.
 
 ### Exceptions
 - Catch specific exception types, never bare `except:` or `except Exception`.
@@ -98,14 +98,14 @@ source "$DIMOS_VENV/bin/activate" && cd "$REPO_ROOT" && pytest
 ## Tests
 - Every non-trivial unit gets a `pytest` test. Importing DimOS in tests is fine (it is
   installed in the venv); keep real hardware and heavy models (robot, EdgeTAM, the VLM) out
-  via pure logic (`ball_movement_state.py`) or fakes for injected module refs.
+  via pure logic (`track_state.py`) or fakes for injected module refs.
 - Test names state the behavior: `test_records_and_recalls_most_recent_location`.
 - Run tests in the venv (see Environment above): `source "$DIMOS_VENV/bin/activate" && cd "$REPO_ROOT" && pytest`.
 
 ## Project layout
-- `src/pawdribble/` — first-party package (importable via `PYTHONPATH=src`).
+- `src/pawtrack/` — first-party package (importable via `PYTHONPATH=src`).
 - `tests/` — pytest suite: pure-logic tests plus DimOS-glue tests that fake injected refs.
-- `docs/` — design (`pawdribble-design.md`), DimOS agent reference (`dimos-agent-findings.md`),
+- `docs/` — design (`pawtrack-design.md`), DimOS agent reference (`dimos-agent-findings.md`),
   and host rationale (`gpu-host-setup.md`).
 - DimOS upstream source for reference lives outside this repo at `$DIMOS_HOME`.
 
