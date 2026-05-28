@@ -45,6 +45,9 @@ from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo
 from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
 from dimos.navigation.visual.query import get_object_bbox_from_image
 from dimos.perception.detection.type.detection2d.bbox import Detection2DBBox
+from dimos.robot.unitree.dimsim_connection import DimSimConnection
+from dimos.robot.unitree.go2.connection import GO2Connection
+from dimos.robot.unitree.mujoco_connection import MujocoConnection
 from dimos.utils.logging_config import setup_logger
 
 from pawtrack.ground_raycast import CameraIntrinsics, pixel_to_ground_point
@@ -157,20 +160,10 @@ class PawTrackSkillContainer(Module):
         if camera_info is None:
             simulation = self.config.g.simulation
             if simulation == "mujoco":
-                from dimos.robot.unitree.mujoco_connection import (
-                    MujocoConnection,
-                )
-
                 camera_info = MujocoConnection.camera_info_static
             elif simulation == "dimsim":
-                from dimos.robot.unitree.dimsim_connection import (
-                    DimSimConnection,
-                )
-
                 camera_info = DimSimConnection.camera_info_static
             else:
-                from dimos.robot.unitree.go2.connection import GO2Connection
-
                 camera_info = GO2Connection.camera_info_static
         if (
             camera_info is None

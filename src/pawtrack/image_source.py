@@ -18,6 +18,9 @@ from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import Out
 from dimos.msgs.sensor_msgs.Image import Image
+from dimos.utils.logging_config import setup_logger
+
+logger = setup_logger()
 
 
 class Config(ModuleConfig):
@@ -74,13 +77,22 @@ class FileImageSource(Module):
             return
         capture = cv2.VideoCapture(self.config.path)
         try:
+            if not capture.isOpened():
+                logger.error(
+                    "FileImageSource: cannot open %r", self.config.path)
+                return
+            produced = False
             while not self._stop.is_set():
                 ok, frame = capture.read()
                 if not ok:
-                    if self.config.loop:
+                    # Loop a real video back to the start; but if not a single
+                    # frame ever decoded, the file is unusable -- stop instead of
+                    # busy-spinning forever on the reset.
+                    if self.config.loop and produced:
                         capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         continue
                     break
+                produced = True
                 self._publish(frame)
                 self._wait()
         finally:
