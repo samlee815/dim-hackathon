@@ -19,6 +19,7 @@ _PURE_MODULES = (
     "pawtrack.visited_registry",
     "pawtrack.approach_geometry",
     "pawtrack.identify",
+    "pawtrack.occupancy",
 )
 
 

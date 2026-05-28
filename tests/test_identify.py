@@ -1,6 +1,12 @@
 """Tests for the multi-target VLM identification prompt + parser."""
 
-from pawtrack.identify import build_prompt, detect_all, parse_bboxes
+from pawtrack.identify import (
+    build_prompt,
+    detect_all,
+    detect_facing,
+    parse_bboxes,
+    parse_facing,
+)
 
 
 def test_parses_array_of_bbox_objects():
@@ -62,3 +68,22 @@ def test_detect_all_queries_with_description_and_parses():
 
 def test_build_prompt_includes_the_description():
     assert "a person in a red shirt" in build_prompt("a person in a red shirt")
+
+
+def test_parse_facing_front_back_and_unknown():
+    assert parse_facing("front") is True
+    assert parse_facing("Front.") is True
+    assert parse_facing("They are facing toward the camera") is True
+    assert parse_facing("back") is False
+    assert parse_facing("facing away") is False
+    assert parse_facing("") is None  # empty
+    assert parse_facing("not sure") is None  # neither cue
+    assert parse_facing("front or back, hard to tell") is None  # both cues
+
+
+def test_detect_facing_queries_and_parses():
+    vl = _FakeVl("front")
+    assert detect_facing(vl, object(), "a chair") is True
+    assert "facing" in vl.prompt.lower()
+    assert "a chair" in vl.prompt  # the prompt asks about the target object
+    assert detect_facing(_FakeVl("back"), object(), "a chair") is False

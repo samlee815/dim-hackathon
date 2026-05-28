@@ -1,14 +1,18 @@
 # PawTrack
 
 A Unitree Go2 hackathon project for a **greeter dog**: the robot wanders a room,
-finds a person sitting on a chair, circles to face them from the front, and
-waves "hi" — built on [DimOS](https://github.com/dimensionalOS/dimos).
+finds a person sitting on a chair, walks over, and waves "hi" — built on
+[DimOS](https://github.com/dimensionalOS/dimos).
 
-This repo currently packages the **perception** slice as DimOS skills: the user
-(or the agent) describes a subject — by default "a person sitting on a chair" —
-the robot identifies it, tracks it frame-to-frame, streams bbox / centering /
-apparent-size metrics, and publishes the subject's position on the floor for a
-planner. The container is perception only; it never drives the robot.
+Two layers, both implemented:
+
+- **Greeter** (`greeter-agentic`, the headline demo): an autonomous loop —
+  wander → identify a person on a chair → pick a random one not greeted recently
+  → navigate to a standoff → wave hello (whichever way they face) → resume
+  wandering. Start it with `start_greeting`.
+- **Perception** (`pawtrack-agentic`): the lower-level tracker — describe a
+  subject, the robot identifies and tracks it and publishes its floor position.
+  Use it standalone via `track_subject`; the greeter reuses the same pieces.
 
 - **Design:** [`docs/pawtrack-design.md`](./docs/pawtrack-design.md)
 - **Build plan:** [`plan.md`](./plan.md)
@@ -19,24 +23,34 @@ planner. The container is perception only; it never drives the robot.
   [`docs/dimos-agent-findings.md`](./docs/dimos-agent-findings.md)
 - **Debugging / monitoring:** [`docs/debugging.md`](./docs/debugging.md)
 
-## Active Slice
+## Greeter Demo
 
-- **Skill container:** `PawTrackSkillContainer` (perception only)
+- **Skill container:** `GreeterSkillContainer` (autonomous loop)
+  - `start_greeting()` — begin wandering and greeting
+  - `stop_greeting()` — halt the loop and the patrol
+  - `greeter_status()` — current phase as JSON
+- **Loop, each step a separate seam:** wander (DimOS `PatrollingModule`) →
+  identify (multi-box VLM) → select (random, by floor position, not greeted in
+  the last `revisit_forget_s`) → navigate (ground-distance + centering) → greet
+  (halt → `Hello` wave, any facing → `RecoveryStand` + `BalanceStand`).
+
+```bash
+PYTHONPATH=src dimos run greeter-agentic --robot-ip <dog_ip>
+dimos mcp call start_greeting
+dimos mcp call stop_greeting
+```
+
+## Perception Slice
+
+- **Skill container:** `PawTrackSkillContainer`
   - `track_subject(description="a person sitting on a chair", ...)`
   - `tracking_status()`
   - `stop_tracking()`
-- **Perception strategy:** VLM acquisition for the described subject, then
-  EdgeTAM tracking for frame-to-frame monitoring.
+- **Strategy:** VLM acquisition for the described subject, then EdgeTAM tracking
+  frame-to-frame.
 - **Output:** JSON status on `/subject_status` (bbox, center pixel, image-center
   error, bbox area, optional mask area, age), plus the subject's floor position
   on `/subject_world_pose` (and `/subject_map_pose` with relocalization).
-
-## Teammate Seam
-
-The motion / navigation layer (wander, approach, orbit-to-front, greet) is built
-separately and consumes the perception streams (`/subject_status`,
-`/debug_image`, `/subject_world_pose`). The current container only perceives and
-locates the subject; it does not plan routes, approach, or move the robot.
 
 ## Layout
 

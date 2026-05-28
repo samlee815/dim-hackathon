@@ -109,12 +109,15 @@ class _FakeTracker:
 
 
 class _FakeVl:
-    def __init__(self, response):
+    def __init__(self, response, facing="back"):
         self.response = response
+        self.facing = facing  # answer to the front/back facing prompt
         self.last_prompt = None
 
     def query(self, _image, prompt):
         self.last_prompt = prompt
+        if "facing" in prompt.lower():  # the post-wave facing-detection query
+            return self.facing
         return self.response
 
     def stop(self):
@@ -140,7 +143,7 @@ class _FakeTf:
         return _FakeTransform() if self._present else None
 
 
-def _container(vl_response="[]", track_bbox=None):
+def _container(vl_response="[]", track_bbox=None, facing="back"):
     c = GreeterSkillContainer()
     c.cmd_vel = _Recorder()
     c.debug_image = _Recorder()
@@ -151,8 +154,9 @@ def _container(vl_response="[]", track_bbox=None):
     c._intrinsics = CameraIntrinsics(fx=100.0, fy=100.0, cx=320.0, cy=240.0)
     c._tf = _FakeTf()
     c._latest_image = _FakeImage()
-    c._vl_model = _FakeVl(vl_response)
+    c._vl_model = _FakeVl(vl_response, facing)
     c._tracker = _FakeTracker(track_bbox)
+    c.config.recover_settle_s = 0.0  # no real RecoveryStand->BalanceStand wait
     # Short timers so the timed phases advance within the test.
     c._machine = GreeterMachine(GreeterParams(
         standoff_m=1.5, standoff_tolerance_m=0.3,
@@ -173,6 +177,20 @@ class _FakeOdom:
     def __init__(self, x, y, yaw=0.0):
         self.position = _FakeVec(x, y)
         self.yaw = yaw
+
+
+class _FakeOrigin:
+    def __init__(self, x, y):
+        self.position = _FakeVec(x, y)
+
+
+class _FakeCostmap:
+    """Minimal OccupancyGrid stand-in: grid[y][x] costs, resolution, origin."""
+
+    def __init__(self, grid, resolution, origin_xy):
+        self.grid = grid
+        self.resolution = resolution
+        self.origin = _FakeOrigin(*origin_xy)
 
 
 def _sport_ids(connection):
@@ -279,6 +297,58 @@ def test_subject_is_re_greeted_after_the_forget_window():
 
     c._tick(70.0)  # past the forget window -> re-engage the same person
     assert c._machine.state == "approach"
+
+
+def test_greets_with_a_heart_when_the_subject_faces_the_camera():
+    c = _container(
+        vl_response='[{"bbox": [450, 200, 490, 240]}]',
+        track_bbox=_SUBJECT_BBOX, facing="front")
+    c.config.heart_duration_s = 0.0  # no real wait in the test
+    c._tick(2.0)  # wander -> approach
+    c._tick(2.1)  # approach -> greet (Hello)
+    c._tick(2.8)  # greet -> cooldown: facing=front -> FingerHeart
+
+    ids = _sport_ids(c._connection)
+    heart = greeter_container._FINGER_HEART_API_ID
+    assert heart in ids  # rewarded the facing subject
+    # ... after the wave and before recovery: Hello -> FingerHeart -> RecoveryStand
+    assert ids.index(1016) < ids.index(heart) < ids.index(1006)
+
+
+def test_no_heart_when_the_subject_faces_away():
+    c = _container(
+        vl_response='[{"bbox": [450, 200, 490, 240]}]',
+        track_bbox=_SUBJECT_BBOX, facing="back")
+    c.config.heart_duration_s = 0.0
+    c._tick(2.0)
+    c._tick(2.1)
+    c._tick(2.8)  # facing away -> no heart, just move on
+    assert greeter_container._FINGER_HEART_API_ID not in _sport_ids(c._connection)
+
+
+def test_facing_failure_still_recovers_and_marks_visited():
+    # If the post-wave VLM facing call blows up, the dog must still recover and
+    # mark the subject visited -- the cooldown effects run once on the edge, so a
+    # raised exception would otherwise freeze it after Hello and let it re-greet
+    # the same subject.
+    c = _container(
+        vl_response='[{"bbox": [450, 200, 490, 240]}]', track_bbox=_SUBJECT_BBOX)
+    c.config.heart_duration_s = 0.0
+
+    def query(_image, prompt):
+        if "facing" in prompt.lower():
+            raise RuntimeError("VLM timeout")
+        return '[{"bbox": [450, 200, 490, 240]}]'
+
+    c._vl_model.query = query
+
+    c._tick(2.0)  # wander -> approach
+    c._tick(2.1)  # approach -> greet
+    c._tick(2.8)  # greet -> cooldown: facing query raises, must not abort cleanup
+
+    assert c._machine.state == "cooldown"
+    assert 1006 in _sport_ids(c._connection)  # RecoveryStand still sent
+    assert c._registry.is_visited((1.5, 0.0), now=2.8)  # subject still marked
 
 
 def test_approach_drives_by_ground_distance_not_a_width_model():
@@ -486,6 +556,130 @@ def test_scan_clamps_off_frame_boxes_before_locating():
     assert candidates[0].bbox[2] == 640.0  # clamped to the frame width
     # Clamped bottom-center (620, 240) -> floor x = (620-320)/100 = 3.0.
     assert candidates[0].position == pytest.approx((3.0, 0.0))
+
+
+def test_scan_drops_a_candidate_on_a_mapped_wall():
+    # The reflection case: the VLM box raycasts onto the floor at (1.5, 0.0),
+    # but the costmap marks that spot a wall (a person seen reflected in glass).
+    c = _container(vl_response='[{"bbox": [450, 200, 490, 240]}]')
+    assert len(c._scan(_FakeImage())) == 1  # no costmap yet -> kept
+
+    res = 0.1
+    wall = [[0] * 11 for _ in range(11)]
+    wall[5][5] = 100  # lethal cell at the candidate's floor position
+    c._latest_costmap = _FakeCostmap(wall, res, (1.5 - 5 * res, 0.0 - 5 * res))
+    assert c._scan(_FakeImage()) == []  # dropped: on a mapped wall
+
+    free = [[0] * 11 for _ in range(11)]
+    c._latest_costmap = _FakeCostmap(free, res, (1.5 - 5 * res, 0.0 - 5 * res))
+    assert len(c._scan(_FakeImage())) == 1  # free space at the same spot -> kept
+
+
+def test_obstacle_filter_can_be_disabled():
+    c = _container(vl_response='[{"bbox": [450, 200, 490, 240]}]')
+    wall = [[100] * 11 for _ in range(11)]
+    c._latest_costmap = _FakeCostmap(wall, 0.1, (1.0, -0.5))
+    c.config.reject_on_mapped_obstacle = False
+    assert len(c._scan(_FakeImage())) == 1  # filter off -> kept despite the wall
+
+
+def test_scan_drops_a_candidate_beyond_the_distance_bound():
+    # A box near the image horizon ranges to a far floor point; such a phantom
+    # is dropped before the dog commits to it and walks at empty space.
+    c = _container(vl_response='[{"bbox": [450, 200, 490, 240]}]')
+    c._locate = lambda box, image: ((50.0, 0.0), 50.0)  # 50 m ranging artifact
+    assert c._scan(_FakeImage()) == []  # 50 m > the 15 m bound -> dropped
+    c.config.max_subject_distance_m = 100.0
+    assert len(c._scan(_FakeImage())) == 1  # within a looser bound -> kept
+
+
+def test_roams_forward_when_odom_stalls_in_wander():
+    # Patrol is goal-less and the dog is not moving: detect the stall from odom
+    # and take over with a forward roam into new space.
+    c = _container(vl_response="[]")
+    c._latest_odom = _FakeOdom(0.0, 0.0)
+    c.config.stall_timeout_s = 1.0
+    c.config.roam_turn_s = 0.0  # skip the reorient phase -> straight to forward
+    c._patrolling_module_spec.patrolling = True
+    c._wander_tick(c._latest_image, 0.0)  # establish the anchor (not yet stalled)
+    assert not c._roaming
+
+    c.cmd_vel.msgs.clear()
+    c._wander_tick(c._latest_image, 2.0)  # no movement for 2 s > 1 s -> roam
+
+    assert c._roaming
+    last = c.cmd_vel.msgs[-1]
+    assert last.linear.x > 0.0  # driving forward into new space
+    assert not c._patrolling_module_spec.is_patrolling()  # took over the patrol
+
+
+def test_roam_reorients_in_place_before_driving_forward():
+    c = _container(vl_response="[]")
+    c._latest_odom = _FakeOdom(0.0, 0.0)
+    c.config.stall_timeout_s = 1.0
+    c.config.roam_turn_s = 2.0
+    c._wander_tick(c._latest_image, 0.0)
+    c.cmd_vel.msgs.clear()
+    c._wander_tick(c._latest_image, 2.0)  # enters roam; within the turn phase
+    turn = c.cmd_vel.msgs[-1]
+    assert turn.angular.z != 0.0 and turn.linear.x == 0.0  # reorient first
+
+
+def test_roam_hands_back_to_patrol_after_escaping():
+    c = _container(vl_response="[]")
+    c._latest_odom = _FakeOdom(0.0, 0.0)
+    c.config.stall_timeout_s = 1.0
+    c.config.roam_turn_s = 0.0
+    c.config.roam_escape_distance_m = 0.5
+    c._wander_tick(c._latest_image, 0.0)
+    c._wander_tick(c._latest_image, 2.0)  # stalled -> roaming
+    assert c._roaming
+
+    c._latest_odom = _FakeOdom(1.0, 0.0)  # escaped 1 m > 0.5 m
+    c._wander_tick(c._latest_image, 2.5)
+
+    assert not c._roaming
+    assert c._patrolling_module_spec.is_patrolling()  # patrol resumed
+
+
+def test_no_roam_while_making_progress():
+    c = _container(vl_response="[]")
+    c._latest_odom = _FakeOdom(0.0, 0.0)
+    c.config.stall_timeout_s = 1.0
+    c._wander_tick(c._latest_image, 0.0)
+    c._latest_odom = _FakeOdom(0.0, 0.5)  # moved 0.5 m (> 0.3 threshold)
+    c._wander_tick(c._latest_image, 2.0)
+    assert not c._roaming  # movement resets the stall timer
+
+
+def test_no_roam_without_odom():
+    c = _container(vl_response="[]")
+    c._latest_odom = None  # no odom -> never drive blind
+    c.config.stall_timeout_s = 1.0
+    c._wander_tick(c._latest_image, 0.0)
+    c.cmd_vel.msgs.clear()
+    c._wander_tick(c._latest_image, 5.0)
+    assert not c._roaming
+    assert c._patrolling_module_spec.is_patrolling()  # patrol owns motion
+
+
+def test_wander_rescans_when_every_detection_is_filtered_out():
+    # The freeze case: the dog faces a wall/reflection -- it detects a "person"
+    # but the costmap filter drops it, leaving no candidate. It must rotate to a
+    # new heading rather than sit frozen (the patrol is usually goal-less here).
+    c = _container(vl_response='[{"bbox": [450, 200, 490, 240]}]')
+    wall = [[100] * 11 for _ in range(11)]  # candidate raycasts to (1.5, 0.0)
+    c._latest_costmap = _FakeCostmap(wall, 0.1, (1.0, -0.5))
+    c._patrolling_module_spec.patrolling = True
+    c.cmd_vel.msgs.clear()
+
+    c._tick(2.0)  # past the first scan interval
+
+    assert c._last_scan_dropped > 0  # the detection was filtered out
+    assert c._rescanning  # rotating to look elsewhere, not frozen
+    last = c.cmd_vel.msgs[-1]
+    assert last.angular.z != 0.0 and last.linear.x == 0.0  # in-place yaw
+    assert not c._patrolling_module_spec.is_patrolling()  # took over the patrol
 
 
 def test_halt_zeros_velocity_and_stops_patrol():

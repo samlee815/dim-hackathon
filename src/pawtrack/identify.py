@@ -108,3 +108,54 @@ def detect_all(vl_model: object, image: object, description: str) -> list[BBox]:
     """
     response = vl_model.query(image, build_prompt(description))
     return parse_bboxes(response)
+
+
+def build_facing_prompt(description: str) -> str:
+    """Prompt asking whether the target object faces the camera (front/back).
+
+    Parameterised by the subject ``description`` so the same check works for
+    whatever the greeter targets: a seated person on the robot, or a chair in
+    simulation. A chair shows its backrest / is seen from behind when "facing
+    away", so this lets the front/back logic (and the FingerHeart reward) be
+    exercised in sim by pointing at chairs in different orientations.
+    """
+    return (
+        "In this image, is {description} facing TOWARD the camera, or facing "
+        "AWAY from it? A back / backrest / rear view, or seeing it from behind, "
+        'counts as facing away. Answer with exactly one word: "front" if it '
+        'faces the camera, "back" if it faces away.'
+    ).format(description=description)
+
+
+def parse_facing(response_text: str) -> bool | None:
+    """Parse a front/back facing answer leniently.
+
+    Returns True for a clear "front" (facing the camera), False for a clear
+    "back" (facing away), and None when the answer mentions both or neither
+    (orientation unknown) -- the caller picks a safe default.
+    """
+    if not response_text:
+        return None
+    low = response_text.strip().lower()
+    front = "front" in low or "toward" in low or "towards" in low
+    back = "back" in low or "away" in low or "behind" in low
+    if front == back:  # both cues, or neither -> undecided
+        return None
+    return front
+
+
+def detect_facing(
+    vl_model: object, image: object, description: str
+) -> bool | None:
+    """Ask ``vl_model`` whether the targeted subject faces the camera.
+
+    Args:
+        vl_model: Anything with ``query(image, prompt) -> str``.
+        image: The frame to pass through to the model.
+        description: The subject being greeted (e.g. "a person sitting on a
+            chair", or "a chair" in sim), so the prompt asks about that object.
+
+    Returns:
+        True if facing the camera, False if facing away, None if undecided.
+    """
+    return parse_facing(vl_model.query(image, build_facing_prompt(description)))

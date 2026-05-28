@@ -48,6 +48,7 @@ from dimos.models.vl.base import VlModel
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
+from dimos.msgs.nav_msgs.OccupancyGrid import OccupancyGrid
 from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo
 from dimos.msgs.sensor_msgs.Image import Image
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
@@ -75,7 +76,8 @@ from pawtrack.greeter_state import (
     GreeterSnapshot,
 )
 from pawtrack.ground_raycast import CameraIntrinsics, pixel_to_ground_point
-from pawtrack.identify import detect_all
+from pawtrack.identify import detect_all, detect_facing
+from pawtrack.occupancy import is_near_obstacle
 from pawtrack.qwen_china import QwenChinaVlModel
 from pawtrack.track_state import clamp_bbox, ground_contact_pixel, valid_bbox
 from pawtrack.visited_registry import Candidate, VisitedRegistry, select_target
@@ -85,6 +87,9 @@ logger = setup_logger()
 _HELLO_API_ID = SPORT_CMD["Hello"]
 _BALANCE_STAND_API_ID = SPORT_CMD["BalanceStand"]
 _RECOVERY_STAND_API_ID = SPORT_CMD["RecoveryStand"]
+_FINGER_HEART_API_ID = SPORT_CMD["FingerHeart"]
+# api_id -> name, for readable sport-command tracing in the logs.
+_SPORT_NAMES = {api_id: name for name, api_id in SPORT_CMD.items()}
 
 
 class Config(ModuleConfig):
@@ -100,6 +105,24 @@ class Config(ModuleConfig):
     # (e.g. once everyone in view has been greeted).
     wander_rescan_yaw_radps: float = 0.5
     wander_rescan_max_s: float = 8.0
+    # Free-explore fallback. The coverage patrol goes silent once it has no goal
+    # (e.g. coverage exhausted), and is_patrolling() cannot tell us that, so the
+    # dog would sit frozen. Detect the wedge from odom -- no position change
+    # beyond stall_move_threshold_m for stall_timeout_s -- then take over and
+    # roam into new space (brief in-place reorient, then forward) until the dog
+    # has escaped roam_escape_distance_m from the stuck spot (or roam_max_s
+    # elapses), then hand back so the patrol can replan from the new location.
+    # Needs odom; with none it falls back to the rotate-only rescan and never
+    # drives blind. roam_forward_mps stays above the sim RL translation deadband
+    # (~0.2-0.3 m/s).
+    enable_roam_when_wedged: bool = True
+    stall_move_threshold_m: float = 0.3
+    stall_timeout_s: float = 4.0
+    roam_forward_mps: float = 0.35
+    roam_yaw_radps: float = 0.6
+    roam_turn_s: float = 1.5
+    roam_escape_distance_m: float = 1.0
+    roam_max_s: float = 6.0
     # Stop the loop (failing safe) after this many consecutive tick exceptions.
     max_consecutive_errors: int = 5
     # Phase thresholds (fed to the pure GreeterMachine).
@@ -124,6 +147,9 @@ class Config(ModuleConfig):
     redetect_radius_m: float = 1.0
     greet_duration_s: float = 4.0
     cooldown_duration_s: float = 6.0
+    # After the wave, if the subject faces the camera, reward them with a
+    # FingerHeart; this is how long to let that gesture play before recovering.
+    heart_duration_s: float = 3.0
     # Settle time between RecoveryStand and BalanceStand in a one-shot wave.
     recover_settle_s: float = 1.5
     # A sport command (Hello / BalanceStand / RecoveryStand) goes out over the
@@ -159,6 +185,22 @@ class Config(ModuleConfig):
     lidar_log_interval_s: float = 3.0
     world_floor_z_m: float = 0.0
     tf_tolerance_s: float = 1.0
+    # Reflection filter: drop a candidate whose floor position lands on (or
+    # within this clearance of) a mapped wall in the navigation costmap. A person
+    # reflected in a glass wall is detected by the VLM and ranged by the lidar at
+    # the glass surface, so without this the dog walks over and waves at the
+    # reflection; a real subject stands in free space. Fails open -- no costmap
+    # means no filtering -- so a fresh, unmapped run greets exactly as before.
+    reject_on_mapped_obstacle: bool = True
+    obstacle_clearance_m: float = 0.3
+    obstacle_cost_threshold: int = 50  # 0 free .. 100 lethal; raise to be lenient
+    # Distance sanity bound: drop a candidate whose floor range from the robot
+    # exceeds this. A box near the image horizon raycasts to a near-infinite floor
+    # point, so without this the dog commits to phantom targets metres (even tens
+    # of metres) away and walks at empty space. Set generously (30 m) so the dog
+    # can still notice and head toward distant real people while the bound only
+    # culls the clearly-impossible horizon artifacts.
+    max_subject_distance_m: float = 30.0
 
 
 class GreeterSkillContainer(Module):
@@ -169,6 +211,7 @@ class GreeterSkillContainer(Module):
     color_image: In[Image]
     lidar: In[PointCloud2]  # world-frame lidar cloud for subject ranging
     odom: In[PoseStamped]  # robot world pose, for dead reckoning to a lost subject
+    global_costmap: In[OccupancyGrid]  # nav costmap; rejects on-wall candidates
     cmd_vel: Out[Twist]
     debug_image: Out[Image]  # annotated frame: bbox + phase/distance/front
     greeter_phase: Out[str]  # rich JSON trace: phase + why (distinct from the
@@ -187,6 +230,7 @@ class GreeterSkillContainer(Module):
         self._latest_image: Image | None = None
         self._latest_pointcloud: PointCloud2 | None = None
         self._latest_odom: PoseStamped | None = None
+        self._latest_costmap: OccupancyGrid | None = None
         self._last_lidar_log_s = 0.0
         # Horizontal bbox error of the last successful track, for re-centering
         # the search yaw when the tracker briefly drops the subject.
@@ -210,9 +254,19 @@ class GreeterSkillContainer(Module):
         self._chosen: Candidate | None = None
         self._last_position: tuple[float, float] | None = None
         self._last_scan_s = 0.0
+        # How many detections the last scan dropped (too far / on a wall), so
+        # wander can rotate away from a wall/reflection instead of freezing.
+        self._last_scan_dropped = 0
         # Rescan state: rotating in place to look past already-greeted people.
         self._rescanning = False
         self._rescan_started_s = 0.0
+        # Free-explore (roam-when-wedged) state, driven by odom stall detection.
+        self._roaming = False
+        self._roam_anchor_xy: tuple[float, float] | None = None
+        self._roam_progress_s = 0.0
+        self._roam_start_xy: tuple[float, float] = (0.0, 0.0)
+        self._roam_started_s = 0.0
+        self._roam_turn_dir = 1.0
         self._last_snapshot: GreeterSnapshot | None = None
         self._last_trace: str | None = None  # last rich greeter_phase JSON
         camera_info = self._resolve_camera_info()
@@ -252,6 +306,19 @@ class GreeterSkillContainer(Module):
         self.register_disposable(
             Disposable(self.odom.subscribe(self._on_odom))
         )
+        # The costmap feeds the reflection filter (drop candidates on a mapped
+        # wall). Optional: if no mapper is wired the filter simply never fires.
+        self.register_disposable(
+            Disposable(self.global_costmap.subscribe(self._on_costmap))
+        )
+        # Trace the connection up front: if it is None, every sport gesture
+        # (Hello / FingerHeart / Recovery / Balance) silently no-ops -- the first
+        # thing to check when "it greets but does not wave".
+        conn = self._connection
+        logger.info(
+            "greeter: GO2 connection = %s",
+            type(conn).__name__ if conn is not None
+            else "NONE -- sport gestures will no-op")
 
     @rpc
     def stop(self) -> None:
@@ -398,8 +465,12 @@ class GreeterSkillContainer(Module):
                 target_acquired=acquired, subject_visible=acquired)
         elif state == "approach":
             obs = self._engage_tick(image)
-        else:  # greet / cooldown -- hold still, timed transitions
-            self.cmd_vel.publish(Twist.zero())
+        else:  # greet / cooldown -- the sport gesture plays here
+            # Do NOT stream cmd_vel during the gesture. The dog was already
+            # halted on the greet edge (_on_enter -> _halt), and on the Go2,
+            # streaming cmd_vel keeps it in joystick/balance mode, which
+            # suppresses sport animations (Hello / FingerHeart) and the
+            # RecoveryStand -- a likely reason a *sent* gesture does not play.
             obs = GreeterObservation()
 
         snapshot = self._machine.step(obs, now)
@@ -413,12 +484,13 @@ class GreeterSkillContainer(Module):
     def _wander_tick(self, image: Image | None, now: float) -> bool:
         """Roam (via the patrol), scan for a target, and break free if wedged.
 
-        The patrol normally owns wander motion. But when the dog can see people
-        yet every one is already greeted/skipped, the patrol typically has no
-        goal -- and the person right ahead is an obstacle -- so the dog freezes
-        facing a handled subject. In that case the greeter rotates in place to
-        rescan a new direction until it finds someone unvisited, then (bounded)
-        hands back to the patrol from the new heading.
+        The patrol normally owns wander motion. But the patrol often has no goal
+        when the dog faces something it cannot act on -- everyone in view already
+        greeted, or every detection rejected by the filters (too far, or on a
+        mapped wall, e.g. a glass reflection) -- and the thing ahead is an
+        obstacle, so the dog freezes staring at it. In that case the greeter
+        rotates in place to rescan a new direction, then (bounded) hands back to
+        the patrol from the new heading.
         """
         chosen: Candidate | None = None
         candidates: list[Candidate] = []
@@ -447,12 +519,17 @@ class GreeterSkillContainer(Module):
             if chosen is not None:
                 logger.warning(
                     "greeter: tracker init failed on the chosen subject")
-            # Start rotating when people are visible but all are already handled;
-            # stop once the view clears (the patrol can explore from there).
-            if candidates and chosen is None and not self._rescanning:
+            # Rotate to a new heading when the view holds something the dog
+            # cannot act on -- people already greeted (kept candidates) OR
+            # detections all rejected as too-far/on-a-wall (a wall/reflection the
+            # filter dropped). Either way the patrol is usually goal-less here, so
+            # rotating finds a fresh direction instead of freezing. Stop once the
+            # view is genuinely empty so the patrol can explore from there.
+            saw_something = bool(candidates) or self._last_scan_dropped > 0
+            if saw_something and chosen is None and not self._rescanning:
                 self._rescanning = True
                 self._rescan_started_s = now
-            elif not candidates:
+            elif not saw_something:
                 self._rescanning = False
         # Don't spin forever (e.g. everyone in view is greeted): after a bounded
         # rotation, hand back to the patrol to retry from the new heading.
@@ -463,6 +540,15 @@ class GreeterSkillContainer(Module):
             if self._patrolling_module_spec.is_patrolling():
                 self._patrolling_module_spec.stop_patrol()
             self.cmd_vel.publish(self._rescan_twist())
+            self._reset_roam(now)  # rotating is activity; don't also roam now
+            return False
+        # Free-explore: when odom shows the dog is wedged (patrol goal-less and
+        # not moving), roam into new space, then hand back to the patrol.
+        roam = self._roam_tick(now)
+        if roam is not None:
+            if self._patrolling_module_spec.is_patrolling():
+                self._patrolling_module_spec.stop_patrol()
+            self.cmd_vel.publish(roam)
         elif not self._patrolling_module_spec.is_patrolling():
             self._patrolling_module_spec.start_patrol()
         return False
@@ -473,9 +559,79 @@ class GreeterSkillContainer(Module):
             linear=Vector3(0.0, 0.0, 0.0),
             angular=Vector3(0.0, 0.0, self.config.wander_rescan_yaw_radps))
 
+    def _reset_roam(self, now: float) -> None:
+        """Clear roam state (rescan takes over, the dog escaped, or a new run)."""
+        self._roaming = False
+        self._roam_anchor_xy = None
+        self._roam_progress_s = now
+
+    def _roam_tick(self, now: float) -> Twist | None:
+        """Roam into new space when the dog is wedged; None when it is not.
+
+        The coverage patrol cannot tell us it is goal-less, so the wedge is
+        detected from odom: no position change beyond ``stall_move_threshold_m``
+        for ``stall_timeout_s``. On a wedge the dog takes over -- a brief in-place
+        reorient (``roam_turn_s``) so it does not drive straight back into
+        whatever blocked it, then forward at ``roam_forward_mps`` -- until it has
+        escaped ``roam_escape_distance_m`` from the stuck spot (or ``roam_max_s``
+        elapses), then it stops roaming so the caller hands back to the patrol.
+        Returns None (no roam) when disabled, when odom is unavailable (never
+        drive blind), or while the dog is already making progress.
+        """
+        if not self.config.enable_roam_when_wedged:
+            return None
+        with self._lock:
+            odom = self._latest_odom
+        if odom is None:
+            return None
+        xy = (odom.position.x, odom.position.y)
+        if self._roam_anchor_xy is None:
+            self._roam_anchor_xy = xy
+            self._roam_progress_s = now
+        if not self._roaming:
+            moved = math.hypot(
+                xy[0] - self._roam_anchor_xy[0], xy[1] - self._roam_anchor_xy[1])
+            if moved > self.config.stall_move_threshold_m:
+                self._roam_anchor_xy = xy  # progress -> reset the stall timer
+                self._roam_progress_s = now
+                return None
+            if now - self._roam_progress_s < self.config.stall_timeout_s:
+                return None
+            # Wedged: start roaming from here, in a random direction.
+            self._roaming = True
+            self._roam_start_xy = xy
+            self._roam_started_s = now
+            self._roam_turn_dir = self._rng.choice((-1.0, 1.0))
+        escaped = math.hypot(
+            xy[0] - self._roam_start_xy[0], xy[1] - self._roam_start_xy[1])
+        if (escaped > self.config.roam_escape_distance_m
+                or now - self._roam_started_s > self.config.roam_max_s):
+            self._reset_roam(now)
+            return None
+        # Reorient in place first, then drive forward (a slight same-way curve so
+        # repeated wedges sweep the area rather than retrace one line).
+        if now - self._roam_started_s < self.config.roam_turn_s:
+            return Twist(
+                linear=Vector3(0.0, 0.0, 0.0),
+                angular=Vector3(
+                    0.0, 0.0, self._roam_turn_dir * self.config.roam_yaw_radps))
+        return Twist(
+            linear=Vector3(self.config.roam_forward_mps, 0.0, 0.0),
+            angular=Vector3(
+                0.0, 0.0,
+                self._roam_turn_dir * self.config.roam_yaw_radps * 0.3))
+
     def _scan(self, image: Image) -> list[Candidate]:
-        """Detect every described subject and locate each on the floor."""
+        """Detect every described subject and locate each on the floor.
+
+        Candidates whose floor position lands on a mapped wall are dropped: a
+        person reflected in a glass wall is detected by the VLM and ranged by
+        the lidar at the glass surface, so without this filter the dog walks
+        over and waves at the reflection. A real subject stands in free space.
+        """
         candidates: list[Candidate] = []
+        n_too_far = 0
+        n_on_wall = 0
         for raw in detect_all(self._get_vl_model(), image, self._description):
             # Reject out-of-frame / degenerate boxes here, before one can be
             # selected and stop the patrol only to fail tracker init later.
@@ -489,9 +645,51 @@ class GreeterSkillContainer(Module):
             located = self._locate(box, image)
             if located is None:
                 continue
-            position, _distance = located
+            position, distance = located
+            # Distance sanity bound: a box near the horizon raycasts to a
+            # near-infinite floor point, so drop implausibly far "subjects"
+            # before engaging a phantom and walking at empty space.
+            if distance > self.config.max_subject_distance_m:
+                n_too_far += 1
+                continue
+            if self._on_mapped_obstacle(position):
+                n_on_wall += 1
+                continue
             candidates.append(Candidate(position=position, bbox=box))
+        # Record drops so wander can tell "empty room" (do nothing, let the
+        # patrol roam) from "saw things but rejected them all" (wedged facing a
+        # wall/reflection -> rotate to look elsewhere, since the candidate list
+        # being emptied would otherwise suppress the rescan).
+        self._last_scan_dropped = n_too_far + n_on_wall
+        if n_too_far or n_on_wall:
+            logger.info(
+                "greeter scan: dropped %d beyond %.0fm and %d on a mapped wall "
+                "(ranging artifacts / glass reflections)",
+                n_too_far, self.config.max_subject_distance_m, n_on_wall)
         return candidates
+
+    def _on_mapped_obstacle(self, position: tuple[float, float]) -> bool:
+        """Whether a candidate floor position lands on/near a mapped wall.
+
+        Reads the latest global costmap (``world`` frame, same as the candidate)
+        and tests it with :func:`pawtrack.occupancy.is_near_obstacle`. Returns
+        False when the filter is disabled or no costmap has arrived, so a missing
+        map never suppresses greeting.
+        """
+        if not self.config.reject_on_mapped_obstacle:
+            return False
+        with self._lock:
+            costmap = self._latest_costmap
+        if costmap is None:
+            return False
+        return is_near_obstacle(
+            costmap.grid,
+            costmap.resolution,
+            (costmap.origin.position.x, costmap.origin.position.y),
+            position,
+            clearance_m=self.config.obstacle_clearance_m,
+            cost_threshold=self.config.obstacle_cost_threshold,
+        )
 
     # -- Step: navigate (approach) --
 
@@ -670,37 +868,83 @@ class GreeterSkillContainer(Module):
             self._halt()
             self._send_sport(_HELLO_API_ID)
         elif state == "cooldown":
-            # The gesture leaves the robot out of BalanceStand. Recover to a clean
-            # stand now; BalanceStand is re-enabled on the wander edge just before
-            # the patrol resumes (the cooldown gives RecoveryStand time to run).
-            self._send_sport(_RECOVERY_STAND_API_ID)
+            # Record the greet and clear the target FIRST. These are pure and
+            # cannot fail, so a hiccup in the fallible steps below (a VLM timeout
+            # or a sport-command error) can never leave the subject un-marked --
+            # which would otherwise let the loop re-select and re-greet it,
+            # because these entered-edge effects do not run again.
             if self._last_position is not None:
                 self._registry.mark_visited(self._last_position, now)
             self._chosen = None
+            # Optional flair: if the subject faces the camera, reward them with a
+            # FingerHeart; if not (or unsure), just move on. Best-effort -- a VLM
+            # or sport failure here must not skip the mandatory recovery below.
+            # The dog is stopped, so the brief blocking gesture is fine (same
+            # pattern as the one-shot wave_hello).
+            try:
+                facing = self._detect_facing()
+                # Logged both ways so the decision is observable in sim, where
+                # the FingerHeart animation itself is a no-op.
+                logger.info(
+                    "greeter: %r faces the camera=%s%s",
+                    self._description, facing,
+                    " -> FingerHeart" if facing else " -> no heart, moving on")
+                if facing:
+                    if self._send_sport(_FINGER_HEART_API_ID):
+                        time.sleep(self.config.heart_duration_s)
+            except Exception:  # noqa: BLE001 - flair must never block recovery
+                logger.exception(
+                    "greeter: facing/heart step failed; skipping it")
+            # Mandatory: the gesture(s) (Hello, and FingerHeart which rears up on
+            # its hind legs) leave the robot out of BalanceStand. Issue
+            # RecoveryStand now; BalanceStand is deferred to the wander edge so
+            # RecoveryStand gets the whole cooldown to physically stand the dog up
+            # before BalanceStand -- sending BalanceStand right after (a 1.5 s
+            # settle) interrupted the stand-up on the real robot.
+            self._send_sport(_RECOVERY_STAND_API_ID)
         elif state == "wander":
-            # Halt any leftover engage command, then re-enable BalanceStand so the
-            # resuming patrol's cmd_vel is accepted.
-            self.cmd_vel.publish(Twist.zero())
-            self._send_sport(_BALANCE_STAND_API_ID)
-            # Skip a subject we gave up on -- a stalled approach (reason "stuck")
-            # or one that was gone when we reached its last-known spot (reason
-            # "lost") -- so we do not immediately re-pick and re-fail on it. The
-            # revisit-forget window still makes it eligible again later (e.g. a
-            # person who stepped away returns).
+            # Record/clear state FIRST (pure, cannot fail): skip a subject we gave
+            # up on -- a stalled approach (reason "stuck") or one that was gone
+            # when we reached its last-known spot (reason "lost") -- so we do not
+            # re-pick and re-fail on it. Doing this before the commands below means
+            # a sport hiccup cannot leave it un-skipped. The revisit-forget window
+            # still makes it eligible again later (e.g. a person who stepped away
+            # returns).
             if reason in ("stuck", "lost") and self._last_position is not None:
                 self._registry.mark_visited(self._last_position, now)
             self._chosen = None
             self._last_position = None
-            # The patrol is (re)started by the next _wander_tick.
+            # Halt any leftover engage command, then re-enable BalanceStand so the
+            # resuming patrol's cmd_vel is accepted -- and, after a greet, this is
+            # the BalanceStand that completes the gesture recovery (RecoveryStand
+            # ran on the cooldown edge and has had the cooldown to settle). The
+            # patrol is (re)started by the next _wander_tick.
+            self.cmd_vel.publish(Twist.zero())
+            self._send_sport(_BALANCE_STAND_API_ID)
+
+    def _detect_facing(self) -> bool:
+        """Whether the just-greeted subject faces the camera (one-shot VLM).
+
+        Asked once after the wave, while the dog is stopped, so its latency does
+        not matter and it costs no extra GPU (the VL model is remote). An
+        ambiguous or unparseable answer defaults to False, so an uncertain read
+        does not trigger the rear-up FingerHeart.
+        """
+        with self._lock:
+            image = self._latest_image
+        if image is None:
+            return False
+        return detect_facing(
+            self._get_vl_model(), image, self._description) is True
 
     def _recover_locomotion(self) -> None:
         """Restore a clean standing + balance state after a sport gesture.
 
-        A gesture (Hello) leaves the robot out of BalanceStand, so cmd_vel is
-        ignored. Bring it back up with RecoveryStand, let it settle, then enter
-        BalanceStand so it can walk and do other things again. Synchronous (used
-        by the one-shot wave, after its loop is already stopped); a no-op
-        off-robot.
+        A gesture (Hello or the FingerHeart) leaves the robot out of
+        BalanceStand, so cmd_vel is ignored. Bring it back up with RecoveryStand,
+        let it settle, then enter BalanceStand so it can walk and do other things
+        again. Synchronous (blocks for ``recover_settle_s``); used both on the
+        loop's cooldown edge and by the one-shot wave. A no-op off-robot.
         """
         self._send_sport(_RECOVERY_STAND_API_ID)
         time.sleep(self.config.recover_settle_s)
@@ -722,15 +966,25 @@ class GreeterSkillContainer(Module):
             True if the command was delivered, False if the channel stayed
             closed across every retry.
         """
+        name = _SPORT_NAMES.get(api_id, "?")
         connection = self._connection
         if connection is None:
-            logger.info("No GO2 connection; sport api_id %d is a no-op.", api_id)
+            logger.warning(
+                "greeter: NO GO2 connection -- sport %s (%d) is a no-op "
+                "(this is why a gesture would not play)", name, api_id)
             return False
         last_error: Exception | None = None
         for attempt in range(self.config.sport_retry_attempts):
             try:
                 connection.publish_request(
                     RTC_TOPIC["SPORT_MOD"], {"api_id": api_id})
+                # Log on success too -- otherwise the gesture/recovery sequence
+                # (Hello / RecoveryStand / BalanceStand / FingerHeart) is
+                # invisible in the run log, which made the "no wave / no stand
+                # up" reports hard to diagnose.
+                logger.info(
+                    "greeter: sent sport %s (%d)%s", name, api_id,
+                    f" [retry {attempt}]" if attempt else "")
                 return True
             except Exception as error:  # noqa: BLE001 - lib raises bare Exception
                 if "Data channel is not open" not in str(error):
@@ -739,9 +993,9 @@ class GreeterSkillContainer(Module):
                 if attempt + 1 < self.config.sport_retry_attempts:
                     time.sleep(self.config.sport_retry_delay_s)
         logger.warning(
-            "greeter: sport api_id %d not delivered after %d attempts (data "
+            "greeter: sport %s (%d) NOT delivered after %d attempts (data "
             "channel not open): %s",
-            api_id, self.config.sport_retry_attempts, last_error)
+            name, api_id, self.config.sport_retry_attempts, last_error)
         return False
 
     # -- Tracker / models / geometry --
@@ -917,6 +1171,10 @@ class GreeterSkillContainer(Module):
         with self._lock:
             self._latest_odom = odom
 
+    def _on_costmap(self, costmap: OccupancyGrid) -> None:
+        with self._lock:
+            self._latest_costmap = costmap
+
     def _publish_world_pose(
         self, image: Image, position: tuple[float, float]
     ) -> None:
@@ -977,6 +1235,9 @@ class GreeterSkillContainer(Module):
         self._last_trace = None
         self._last_scan_s = 0.0
         self._rescanning = False
+        self._roaming = False
+        self._roam_anchor_xy = None
+        self._roam_progress_s = 0.0
 
     def _set_error_status(self, message: str) -> None:
         self._publish_status(GreeterSnapshot(
